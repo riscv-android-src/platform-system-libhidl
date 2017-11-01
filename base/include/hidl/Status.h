@@ -20,7 +20,6 @@
 #include <cstdint>
 #include <sstream>
 
-#include <android-base/macros.h>
 #include <hidl/HidlInternal.h>
 #include <utils/Errors.h>
 #include <utils/StrongPointer.h>
@@ -63,7 +62,6 @@ public:
         EX_ILLEGAL_STATE = -5,
         EX_NETWORK_MAIN_THREAD = -6,
         EX_UNSUPPORTED_OPERATION = -7,
-        EX_SERVICE_SPECIFIC = -8,
 
         // This is special and Java specific; see Parcel.java.
         EX_HAS_REPLY_HEADER = -128,
@@ -76,19 +74,14 @@ public:
     static Status ok();
     // Authors should explicitly pick whether their integer is:
     //  - an exception code (EX_* above)
-    //  - service specific error code
     //  - status_t
     //
-    //  Prefer a generic exception code when possible, then a service specific
-    //  code, and finally a status_t for low level failures or legacy support.
-    //  Exception codes and service specific errors map to nicer exceptions for
-    //  Java clients.
+    // Prefer a generic exception code when possible or a status_t
+    // for low level transport errors. Service specific errors
+    // should be at a higher level in HIDL.
     static Status fromExceptionCode(int32_t exceptionCode);
     static Status fromExceptionCode(int32_t exceptionCode,
                                     const char *message);
-    static Status fromServiceSpecificError(int32_t serviceSpecificErrorCode);
-    static Status fromServiceSpecificError(int32_t serviceSpecificErrorCode,
-                                           const char *message);
     static Status fromStatusT(status_t status);
 
     Status() = default;
@@ -101,8 +94,6 @@ public:
 
     // Set one of the pre-defined exception types defined above.
     void setException(int32_t ex, const char *message);
-    // Set a service specific exception with error code.
-    void setServiceSpecificError(int32_t errorCode, const char *message);
     // Setting a |status| != OK causes generated code to return |status|
     // from Binder transactions, rather than writing an exception into the
     // reply Parcel.  This is the least preferable way of reporting errors.
@@ -113,9 +104,6 @@ public:
     const char *exceptionMessage() const { return mMessage.c_str(); }
     status_t transactionError() const {
         return mException == EX_TRANSACTION_FAILED ? mErrorCode : OK;
-    }
-    int32_t serviceSpecificErrorCode() const {
-        return mException == EX_SERVICE_SPECIFIC ? mErrorCode : 0;
     }
 
     bool isOk() const { return mException == EX_NONE; }
@@ -133,7 +121,6 @@ private:
     //
     // Otherwise, we always write |mException| to the parcel.
     // If |mException| !=  EX_NONE, we write |mMessage| as well.
-    // If |mException| == EX_SERVICE_SPECIFIC we write |mErrorCode| as well.
     int32_t mException = EX_NONE;
     int32_t mErrorCode = 0;
     std::string mMessage;
@@ -142,34 +129,54 @@ private:
 // For gtest output logging
 std::ostream& operator<< (std::ostream& stream, const Status& s);
 
+template<typename T> class Return;
+
 namespace details {
-    class return_status : public details::hidl_log_base {
+    class return_status {
     private:
         Status mStatus {};
         mutable bool mCheckedStatus = false;
+
+        template <typename T, typename U>
+        friend Return<U> StatusOf(const Return<T> &other);
     protected:
-        void checkStatus() const {
-            if (!isOk()) {
-                logAlwaysFatal("Attempted to retrieve value from hidl service, "
-                               "but there was a transport error.");
-            }
-        }
+        void assertOk() const;
     public:
         return_status() {}
-        return_status(Status s) : mStatus(s) {}
+        return_status(const Status& s) : mStatus(s) {}
 
-        return_status(const return_status &) = default;
+        return_status(const return_status &) = delete;
+        return_status &operator=(const return_status &) = delete;
 
-        ~return_status() {
-            // mCheckedStatus must be checked before isOk since isOk modifies mCheckedStatus
-            if (!mCheckedStatus && !isOk()) {
-                logAlwaysFatal("HIDL return status not checked and transport error occured.");
-            }
+        return_status(return_status &&other) {
+            *this = std::move(other);
+        }
+        return_status &operator=(return_status &&other);
+
+        ~return_status();
+
+        bool isOkUnchecked() const {
+            // someone else will have to check
+            return mStatus.isOk();
         }
 
         bool isOk() const {
             mCheckedStatus = true;
             return mStatus.isOk();
+        }
+
+        // Check if underlying error is DEAD_OBJECT.
+        // Check mCheckedStatus only if this method returns true.
+        bool isDeadObject() const {
+            bool dead = mStatus.transactionError() == DEAD_OBJECT;
+
+            // This way, if you only check isDeadObject your process will
+            // only be killed for more serious unchecked errors
+            if (dead) {
+                mCheckedStatus = true;
+            }
+
+            return dead;
         }
 
         // For debugging purposes only
@@ -187,15 +194,22 @@ public:
     Return(T v) : details::return_status(), mVal{v} {}
     Return(Status s) : details::return_status(s) {}
 
-    Return(const Return &) = default;
+    // move-able.
+    // precondition: "this" has checked status
+    // postcondition: other is safe to destroy after moving to *this.
+    Return(Return &&other) = default;
+    Return &operator=(Return &&) = default;
 
     ~Return() = default;
 
     operator T() const {
-        checkStatus();
+        assertOk();
         return mVal;
     }
 
+    T withDefault(T t) {
+        return isOk() ? mVal : t;
+    }
 };
 
 template<typename T> class Return<sp<T>> : public details::return_status {
@@ -209,12 +223,21 @@ public:
     template<typename U> Return(U* v) : details::return_status(), mVal{v} {}
     Return(Status s) : details::return_status(s) {}
 
-    Return(const Return &) = default;
+    // move-able.
+    // precondition: "this" has checked status
+    // postcondition: other is safe to destroy after moving to *this.
+    Return(Return &&other) = default;
+    Return &operator=(Return &&) = default;
+
     ~Return() = default;
 
     operator sp<T>() const {
-        checkStatus();
+        assertOk();
         return mVal;
+    }
+
+    sp<T> withDefault(sp<T> t) {
+        return isOk() ? mVal : t;
     }
 };
 
@@ -222,9 +245,13 @@ public:
 template<> class Return<void> : public details::return_status {
 public:
     Return() : details::return_status() {}
-    Return(Status s) : details::return_status(s) {}
+    Return(const Status& s) : details::return_status(s) {}
 
-    Return(const Return &) = default;
+    // move-able.
+    // precondition: "this" has checked status
+    // postcondition: other is safe to destroy after moving to *this.
+    Return(Return &&) = default;
+    Return &operator=(Return &&) = default;
 
     ~Return() = default;
 };
@@ -232,6 +259,18 @@ public:
 static inline Return<void> Void() {
     return Return<void>();
 }
+
+namespace details {
+// Create a Return<U> from the Status of Return<T>. The provided
+// Return<T> must have an error status and have it checked.
+template <typename T, typename U>
+Return<U> StatusOf(const Return<T> &other) {
+    if (other.mStatus.isOk() || !other.mCheckedStatus) {
+        details::logAlwaysFatal("cannot call statusOf on an OK Status or an unchecked status");
+    }
+    return Return<U>{other.mStatus};
+}
+}  // namespace details
 
 }  // namespace hardware
 }  // namespace android

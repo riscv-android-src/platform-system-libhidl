@@ -17,6 +17,9 @@
 #ifndef ANDROID_HIDL_BINDER_SUPPORT_H
 #define ANDROID_HIDL_BINDER_SUPPORT_H
 
+#include <sys/types.h>
+
+#include <android/hidl/base/1.0/BnHwBase.h>
 #include <android/hidl/base/1.0/IBase.h>
 #include <hidl/HidlSupport.h>
 #include <hidl/HidlTransportUtils.h>
@@ -26,7 +29,6 @@
 #include <hwbinder/IPCThreadState.h>
 #include <hwbinder/Parcel.h>
 #include <hwbinder/ProcessState.h>
-#include <android/hidl/base/1.0/BnHwBase.h>
 // Defines functions for hidl_string, hidl_version, Status, hidl_vec, MQDescriptor,
 // etc. to interact with Parcel.
 
@@ -38,18 +40,9 @@ namespace hardware {
 // DeathRecipient interface.
 struct hidl_binder_death_recipient : IBinder::DeathRecipient {
     hidl_binder_death_recipient(const sp<hidl_death_recipient> &recipient,
-            uint64_t cookie, const sp<::android::hidl::base::V1_0::IBase> &base) :
-        mRecipient(recipient), mCookie(cookie), mBase(base) {
-    }
-    virtual void binderDied(const wp<IBinder>& /*who*/) {
-        sp<hidl_death_recipient> recipient = mRecipient.promote();
-        if (recipient != nullptr) {
-            recipient->serviceDied(mCookie, mBase);
-        }
-    }
-    wp<hidl_death_recipient> getRecipient() {
-        return mRecipient;
-    }
+            uint64_t cookie, const sp<::android::hidl::base::V1_0::IBase> &base);
+    virtual void binderDied(const wp<IBinder>& /*who*/);
+    wp<hidl_death_recipient> getRecipient();
 private:
     wp<hidl_death_recipient> mRecipient;
     uint64_t mCookie;
@@ -58,7 +51,7 @@ private:
 
 // ---------------------- hidl_memory
 
-status_t readEmbeddedFromParcel(hidl_memory *memory,
+status_t readEmbeddedFromParcel(const hidl_memory &memory,
         const Parcel &parcel, size_t parentHandle, size_t parentOffset);
 
 status_t writeEmbeddedToParcel(const hidl_memory &memory,
@@ -66,7 +59,7 @@ status_t writeEmbeddedToParcel(const hidl_memory &memory,
 
 // ---------------------- hidl_string
 
-status_t readEmbeddedFromParcel(hidl_string *string,
+status_t readEmbeddedFromParcel(const hidl_string &string,
         const Parcel &parcel, size_t parentHandle, size_t parentOffset);
 
 status_t writeEmbeddedToParcel(const hidl_string &string,
@@ -90,13 +83,14 @@ status_t writeToParcel(const Status &status, Parcel* parcel);
 
 template<typename T>
 status_t readEmbeddedFromParcel(
-        hidl_vec<T> * /*vec*/,
+        const hidl_vec<T> &vec,
         const Parcel &parcel,
         size_t parentHandle,
         size_t parentOffset,
         size_t *handle) {
     const void *out;
-    return parcel.readEmbeddedBuffer(
+    return parcel.readNullableEmbeddedBuffer(
+            vec.size() * sizeof(T),
             handle,
             parentHandle,
             parentOffset + hidl_vec<T>::kOffsetOfBuffer,
@@ -127,7 +121,7 @@ status_t findInParcel(const hidl_vec<T> &vec, const Parcel &parcel, size_t *hand
 
 template<typename T, MQFlavor flavor>
 ::android::status_t readEmbeddedFromParcel(
-        MQDescriptor<T, flavor> *obj,
+        MQDescriptor<T, flavor> &obj,
         const ::android::hardware::Parcel &parcel,
         size_t parentHandle,
         size_t parentOffset) {
@@ -136,7 +130,7 @@ template<typename T, MQFlavor flavor>
     size_t _hidl_grantors_child;
 
     _hidl_err = ::android::hardware::readEmbeddedFromParcel(
-                &obj->grantors(),
+                obj.grantors(),
                 parcel,
                 parentHandle,
                 parentOffset + MQDescriptor<T, flavor>::kOffsetOfGrantors,
@@ -145,7 +139,7 @@ template<typename T, MQFlavor flavor>
     if (_hidl_err != ::android::OK) { return _hidl_err; }
 
     const native_handle_t *_hidl_mq_handle_ptr;
-   _hidl_err = parcel.readEmbeddedNativeHandle(
+   _hidl_err = parcel.readNullableEmbeddedNativeHandle(
             parentHandle,
             parentOffset + MQDescriptor<T, flavor>::kOffsetOfHandle,
             &_hidl_mq_handle_ptr);
@@ -312,25 +306,43 @@ static status_t writeReferenceToParcel(
 // Otherwise, the smallest possible BnChild is found where IChild is a subclass of IType
 // and iface is of class IChild. BnChild will be used to wrapped the given iface.
 // Return nullptr if iface is null or any failure.
-template <typename IType, typename ProxyType>
+template <typename IType,
+          typename = std::enable_if_t<std::is_same<details::i_tag, typename IType::_hidl_tag>::value>>
 sp<IBinder> toBinder(sp<IType> iface) {
     IType *ifacePtr = iface.get();
     if (ifacePtr == nullptr) {
         return nullptr;
     }
     if (ifacePtr->isRemote()) {
-        return ::android::hardware::IInterface::asBinder(static_cast<ProxyType *>(ifacePtr));
+        return ::android::hardware::IInterface::asBinder(
+            static_cast<BpInterface<IType>*>(ifacePtr));
     } else {
-        std::string myDescriptor = getDescriptor(ifacePtr);
+        std::string myDescriptor = details::getDescriptor(ifacePtr);
         if (myDescriptor.empty()) {
-            // interfaceChain fails
+            // interfaceDescriptor fails
             return nullptr;
         }
-        auto iter = gBnConstructorMap.find(myDescriptor);
-        if (iter == gBnConstructorMap.end()) {
-            return nullptr;
+
+        // for get + set
+        std::unique_lock<std::mutex> _lock = details::gBnMap.lock();
+
+        wp<BHwBinder> wBnObj = details::gBnMap.getLocked(ifacePtr, nullptr);
+        sp<IBinder> sBnObj = wBnObj.promote();
+
+        if (sBnObj == nullptr) {
+            auto func = details::gBnConstructorMap.get(myDescriptor, nullptr);
+            if (!func) {
+                return nullptr;
+            }
+
+            sBnObj = sp<IBinder>(func(static_cast<void*>(ifacePtr)));
+
+            if (sBnObj != nullptr) {
+                details::gBnMap.setLocked(ifacePtr, static_cast<BHwBinder*>(sBnObj.get()));
+            }
         }
-        return sp<IBinder>((iter->second)(reinterpret_cast<void *>(ifacePtr)));
+
+        return sBnObj;
     }
 }
 
@@ -346,7 +358,7 @@ sp<IType> fromBinder(const sp<IBinder>& binderIface) {
         return new ProxyType(binderIface);
     }
     sp<IBase> base = static_cast<BnHwBase*>(binderIface.get())->getImpl();
-    if (canCastInterface(base.get(), IType::descriptor)) {
+    if (details::canCastInterface(base.get(), IType::descriptor)) {
         StubType* stub = static_cast<StubType*>(binderIface.get());
         return stub->getImpl();
     } else {
@@ -354,13 +366,8 @@ sp<IType> fromBinder(const sp<IBinder>& binderIface) {
     }
 }
 
-inline void configureBinderRpcThreadpool(size_t maxThreads, bool callerWillJoin) {
-    ProcessState::self()->setThreadPoolConfiguration(maxThreads, callerWillJoin /*callerJoinsPool*/);
-}
-
-inline void joinBinderRpcThreadpool() {
-    IPCThreadState::self()->joinThreadPool();
-}
+void configureBinderRpcThreadpool(size_t maxThreads, bool callerWillJoin);
+void joinBinderRpcThreadpool();
 
 }  // namespace hardware
 }  // namespace android

@@ -17,16 +17,123 @@
 
 #include <hidl/HidlSupport.h>
 
-#include <android-base/logging.h>
+#include <unordered_map>
 
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-#include <cutils/properties.h>
-#include <regex>
-#include <utility>
-#endif
+#include <android-base/logging.h>
+#include <android-base/parseint.h>
 
 namespace android {
 namespace hardware {
+
+namespace details {
+bool debuggable() {
+#ifdef LIBHIDL_TARGET_DEBUGGABLE
+    return true;
+#else
+    return false;
+#endif
+}
+}  // namespace details
+
+hidl_handle::hidl_handle() {
+    mHandle = nullptr;
+    mOwnsHandle = false;
+}
+
+hidl_handle::~hidl_handle() {
+    freeHandle();
+}
+
+hidl_handle::hidl_handle(const native_handle_t *handle) {
+    mHandle = handle;
+    mOwnsHandle = false;
+}
+
+// copy constructor.
+hidl_handle::hidl_handle(const hidl_handle &other) {
+    mOwnsHandle = false;
+    *this = other;
+}
+
+// move constructor.
+hidl_handle::hidl_handle(hidl_handle &&other) {
+    mOwnsHandle = false;
+    *this = std::move(other);
+}
+
+// assignment operators
+hidl_handle &hidl_handle::operator=(const hidl_handle &other) {
+    if (this == &other) {
+        return *this;
+    }
+    freeHandle();
+    if (other.mHandle != nullptr) {
+        mHandle = native_handle_clone(other.mHandle);
+        if (mHandle == nullptr) {
+            PLOG(FATAL) << "Failed to clone native_handle in hidl_handle";
+        }
+        mOwnsHandle = true;
+    } else {
+        mHandle = nullptr;
+        mOwnsHandle = false;
+    }
+    return *this;
+}
+
+hidl_handle &hidl_handle::operator=(const native_handle_t *native_handle) {
+    freeHandle();
+    mHandle = native_handle;
+    mOwnsHandle = false;
+    return *this;
+}
+
+hidl_handle &hidl_handle::operator=(hidl_handle &&other) {
+    if (this != &other) {
+        freeHandle();
+        mHandle = other.mHandle;
+        mOwnsHandle = other.mOwnsHandle;
+        other.mHandle = nullptr;
+        other.mOwnsHandle = false;
+    }
+    return *this;
+}
+
+void hidl_handle::setTo(native_handle_t* handle, bool shouldOwn) {
+    freeHandle();
+    mHandle = handle;
+    mOwnsHandle = shouldOwn;
+}
+
+const native_handle_t* hidl_handle::operator->() const {
+    return mHandle;
+}
+
+// implicit conversion to const native_handle_t*
+hidl_handle::operator const native_handle_t *() const {
+    return mHandle;
+}
+
+// explicit conversion
+const native_handle_t *hidl_handle::getNativeHandle() const {
+    return mHandle;
+}
+
+void hidl_handle::freeHandle() {
+    if (mOwnsHandle && mHandle != nullptr) {
+        // This can only be true if:
+        // 1. Somebody called setTo() with shouldOwn=true, so we know the handle
+        //    wasn't const to begin with.
+        // 2. Copy/assignment from another hidl_handle, in which case we have
+        //    cloned the handle.
+        // 3. Move constructor from another hidl_handle, in which case the original
+        //    hidl_handle must have been non-const as well.
+        native_handle_t *handle = const_cast<native_handle_t*>(
+                static_cast<const native_handle_t*>(mHandle));
+        native_handle_close(handle);
+        native_handle_delete(handle);
+        mHandle = nullptr;
+    }
+}
 
 static const char *const kEmptyString = "";
 
@@ -41,6 +148,10 @@ hidl_string::~hidl_string() {
 }
 
 hidl_string::hidl_string(const char *s) : hidl_string() {
+    if (s == nullptr) {
+        return;
+    }
+
     copyFrom(s, strlen(s));
 }
 
@@ -79,6 +190,11 @@ hidl_string &hidl_string::operator=(const hidl_string &other) {
 
 hidl_string &hidl_string::operator=(const char *s) {
     clear();
+
+    if (s == nullptr) {
+        return *this;
+    }
+
     copyFrom(s, strlen(s));
     return *this;
 }
@@ -93,15 +209,16 @@ hidl_string::operator std::string() const {
     return std::string(mBuffer, mSize);
 }
 
-hidl_string::operator const char *() const {
-    return mBuffer;
+std::ostream& operator<<(std::ostream& os, const hidl_string& str) {
+    os << str.c_str();
+    return os;
 }
 
 void hidl_string::copyFrom(const char *data, size_t size) {
     // assume my resources are freed.
 
-    if (size > UINT32_MAX) {
-        LOG(FATAL) << "string size can't exceed 2^32 bytes.";
+    if (size >= UINT32_MAX) {
+        LOG(FATAL) << "string size can't exceed 2^32 bytes: " << size;
     }
     char *buf = (char *)malloc(size + 1);
     memcpy(buf, data, size);
@@ -115,11 +232,12 @@ void hidl_string::copyFrom(const char *data, size_t size) {
 void hidl_string::moveFrom(hidl_string &&other) {
     // assume my resources are freed.
 
-    mBuffer = other.mBuffer;
+    mBuffer = std::move(other.mBuffer);
     mSize = other.mSize;
     mOwnsBuffer = other.mOwnsBuffer;
 
     other.mOwnsBuffer = false;
+    other.clear();
 }
 
 void hidl_string::clear() {
@@ -134,7 +252,7 @@ void hidl_string::clear() {
 
 void hidl_string::setToExternal(const char *data, size_t size) {
     if (size > UINT32_MAX) {
-        LOG(FATAL) << "string size can't exceed 2^32 bytes.";
+        LOG(FATAL) << "string size can't exceed 2^32 bytes: " << size;
     }
     clear();
 
@@ -155,103 +273,31 @@ bool hidl_string::empty() const {
     return mSize == 0;
 }
 
-// ----------------------------------------------------------------------
-// HidlInstrumentor implementation.
-HidlInstrumentor::HidlInstrumentor(const std::string &prefix)
-        : mInstrumentationLibPrefix(prefix) {
-    configureInstrumentation(false);
+sp<HidlMemory> HidlMemory::getInstance(hidl_memory&& mem) {
+    sp<HidlMemory> instance = new HidlMemory();
+    *instance = std::move(mem);
+    return instance;
 }
 
-HidlInstrumentor:: ~HidlInstrumentor() {}
-
-void HidlInstrumentor::configureInstrumentation(bool log) {
-    bool enable_instrumentation = property_get_bool(
-            "hal.instrumentation.enable",
-            false);
-    if (enable_instrumentation != mEnableInstrumentation) {
-        mEnableInstrumentation = enable_instrumentation;
-        if (mEnableInstrumentation) {
-            if (log) {
-                LOG(INFO) << "Enable instrumentation.";
-            }
-            registerInstrumentationCallbacks (&mInstrumentationCallbacks);
-        } else {
-            if (log) {
-                LOG(INFO) << "Disable instrumentation.";
-            }
-            mInstrumentationCallbacks.clear();
-        }
+sp<HidlMemory> HidlMemory::getInstance(const hidl_string& name, int fd, uint64_t size) {
+    native_handle_t* handle = native_handle_create(1, 0);
+    if (!handle) {
+        close(fd);
+        LOG(ERROR) << "native_handle_create fails";
+        return new HidlMemory();
     }
+    handle->data[0] = fd;
+
+    hidl_handle hidlHandle;
+    hidlHandle.setTo(handle, true /* shouldOwn */);
+
+    sp<HidlMemory> instance = new HidlMemory(name, std::move(hidlHandle), size);
+    return instance;
 }
 
-void HidlInstrumentor::registerInstrumentationCallbacks(
-        std::vector<InstrumentationCallback> *instrumentationCallbacks) {
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-    std::vector<std::string> instrumentationLibPaths;
-    char instrumentation_lib_path[PROPERTY_VALUE_MAX];
-    if (property_get("hal.instrumentation.lib.path",
-                     instrumentation_lib_path,
-                     "") > 0) {
-        instrumentationLibPaths.push_back(instrumentation_lib_path);
-    } else {
-        instrumentationLibPaths.push_back(HAL_LIBRARY_PATH_SYSTEM);
-        instrumentationLibPaths.push_back(HAL_LIBRARY_PATH_VENDOR);
-        instrumentationLibPaths.push_back(HAL_LIBRARY_PATH_ODM);
-    }
-
-    for (auto path : instrumentationLibPaths) {
-        DIR *dir = opendir(path.c_str());
-        if (dir == 0) {
-            LOG(WARNING) << path << " does not exist. ";
-            return;
-        }
-
-        struct dirent *file;
-        while ((file = readdir(dir)) != NULL) {
-            if (!isInstrumentationLib(file))
-                continue;
-
-            void *handle = dlopen((path + file->d_name).c_str(), RTLD_NOW);
-            if (handle == nullptr) {
-                LOG(WARNING) << "couldn't load file: " << file->d_name
-                    << " error: " << dlerror();
-                continue;
-            }
-            using cb_fun = void (*)(
-                    const InstrumentationEvent,
-                    const char *,
-                    const char *,
-                    const char *,
-                    const char *,
-                    std::vector<void *> *);
-            auto cb = (cb_fun)dlsym(handle, "HIDL_INSTRUMENTATION_FUNCTION");
-            if (cb == nullptr) {
-                LOG(WARNING)
-                    << "couldn't find symbol: HIDL_INSTRUMENTATION_FUNCTION, "
-                       "error: "
-                    << dlerror();
-                continue;
-            }
-            instrumentationCallbacks->push_back(cb);
-            LOG(INFO) << "Register instrumentation callback from "
-                << file->d_name;
-        }
-        closedir(dir);
-    }
-#else
-    // No-op for user builds.
-    return;
-#endif
-}
-
-bool HidlInstrumentor::isInstrumentationLib(const dirent *file) {
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-    if (file->d_type != DT_REG) return false;
-    std::cmatch cm;
-    std::regex e("^" + mInstrumentationLibPrefix + "(.*).profiler.so$");
-    if (std::regex_match(file->d_name, cm, e)) return true;
-#endif
-    return false;
+// it's required to have at least one out-of-line method to avoid weak vtable
+HidlMemory::~HidlMemory() {
+    hidl_memory::~hidl_memory();
 }
 
 }  // namespace hardware

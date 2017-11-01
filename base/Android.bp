@@ -14,20 +14,25 @@
 
 cc_library_shared {
     name: "libhidlbase",
+    vendor_available: true,
+    vndk: {
+        enabled: true,
+        support_system_process: true,
+    },
+    defaults: ["libhidl-defaults"],
     shared_libs: [
         "libbase",
+        "libcutils",
         "liblog",
         "libutils",
-        "libcutils",
     ],
     export_shared_lib_headers: [
-        "libbase",
         "libutils",
+        "libcutils", // for native_handle.h
     ],
     local_include_dirs: ["include"],
     export_include_dirs: ["include"],
 
-    clang: true,
     sanitize: {
         misc_undefined: ["integer"],
     },

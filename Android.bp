@@ -13,13 +13,24 @@
 // limitations under the License.
 
 subdirs = [
+    "adapter",
     "base",           // libhidlbase
     "libhidlmemory",  // libhidlmemory
+    "minijail",
     "transport",      // libhidltransport
 ]
 
+cc_defaults {
+    name: "libhidl-defaults",
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
+
 cc_test {
     name: "libhidl_test",
+    defaults: ["libhidl-defaults"],
     gtest: false,
     srcs: ["test_main.cpp"],
 
@@ -32,7 +43,7 @@ cc_test {
         "libutils",
         "libcutils",
     ],
-    static_libs: ["libgtest"],
+    static_libs: ["libgtest", "libgmock"],
 
     cflags: [
         "-O0",

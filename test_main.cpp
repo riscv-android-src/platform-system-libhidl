@@ -17,8 +17,11 @@
 #define LOG_TAG "LibHidlTest"
 
 #include <android-base/logging.h>
+#include <condition_variable>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <hidl/HidlSupport.h>
+#include <hidl/Status.h>
 #include <hidl/TaskRunner.h>
 #include <vector>
 
@@ -59,6 +62,10 @@ TEST_F(LibHidlTest, StringTest) {
     EXPECT_STREQ(s1.c_str(), "s1");
     hidl_string s2("s2"); // copy constructor from cstr
     EXPECT_STREQ(s2.c_str(), "s2");
+    hidl_string s2a(nullptr); // copy constructor from null cstr
+    EXPECT_STREQ("", s2a.c_str());
+    s2a = nullptr; // = from nullptr cstr
+    EXPECT_STREQ(s2a.c_str(), "");
     hidl_string s3 = hidl_string("s3"); // move =
     EXPECT_STREQ(s3.c_str(), "s3");
     hidl_string s4 = hidl_string("12345", 3); // copy constructor from cstr w/ length
@@ -66,27 +73,43 @@ TEST_F(LibHidlTest, StringTest) {
     hidl_string s5(hidl_string(hidl_string("s5"))); // move constructor
     EXPECT_STREQ(s5.c_str(), "s5");
     hidl_string s6(std::string("s6")); // copy constructor from std::string
-    EXPECT_STREQ(s6, "s6");
+    EXPECT_STREQ(s6.c_str(), "s6");
     hidl_string s7 = std::string("s7"); // copy = from std::string
-    EXPECT_STREQ(s7, "s7");
-    hidl_string s8(s7); // copy constructor
-    EXPECT_STREQ(s8, "s7");
-    hidl_string s9 = s8; // copy =
-    EXPECT_STREQ(s9, "s7");
+    EXPECT_STREQ(s7.c_str(), "s7");
+    hidl_string s8(s7); // copy constructor // NOLINT, test the copy constructor
+    EXPECT_STREQ(s8.c_str(), "s7");
+    hidl_string s9 = s8; // copy =  // NOLINT, test the copy operator
+    EXPECT_STREQ(s9.c_str(), "s7");
     char myCString[20] = "myCString";
     s.setToExternal(&myCString[0], strlen(myCString));
-    EXPECT_STREQ(s, "myCString");
+    EXPECT_STREQ(s.c_str(), "myCString");
     myCString[2] = 'D';
-    EXPECT_STREQ(s, "myDString");
+    EXPECT_STREQ(s.c_str(), "myDString");
     s.clear(); // should not affect myCString
     EXPECT_STREQ(myCString, "myDString");
 
     // casts
     s = "great";
     std::string myString = s;
-    const char *anotherCString = s;
+    const char *anotherCString = s.c_str();
     EXPECT_EQ(myString, "great");
     EXPECT_STREQ(anotherCString, "great");
+
+    const hidl_string t = "not so great";
+    std::string myTString = t;
+    const char * anotherTCString = t.c_str();
+    EXPECT_EQ(myTString, "not so great");
+    EXPECT_STREQ(anotherTCString, "not so great");
+
+    // Assignment from hidl_string to std::string
+    std::string tgt;
+    hidl_string src("some stuff");
+    tgt = src;
+    EXPECT_STREQ(tgt.c_str(), "some stuff");
+
+    // Stream output operator
+    hidl_string msg("hidl_string works with operator<<");
+    std::cout << msg;
 
     // Comparisons
     const char * cstr1 = "abc";
@@ -98,32 +121,47 @@ TEST_F(LibHidlTest, StringTest) {
     const char * cstrNE = "ABC";
     std::string stringNE(cstrNE);
     hidl_string hsNE(cstrNE);
+    const char * cstr2 = "def";
+    std::string string2(cstr2);
+    hidl_string hs2(cstr2);
+
     EXPECT_TRUE(hs1  == hsE);
-    EXPECT_FALSE(hs1 != hsE);
-    EXPECT_TRUE(hs1  != hsNE);
     EXPECT_FALSE(hs1 == hsNE);
     EXPECT_TRUE(hs1  == cstrE);
-    EXPECT_FALSE(hs1 != cstrE);
-    EXPECT_TRUE(hs1  != cstrNE);
     EXPECT_FALSE(hs1 == cstrNE);
     EXPECT_TRUE(hs1  == stringE);
+    EXPECT_FALSE(hs1 == stringNE);
+    EXPECT_FALSE(hs1 != hsE);
+    EXPECT_TRUE(hs1  != hsNE);
+    EXPECT_FALSE(hs1 != cstrE);
+    EXPECT_TRUE(hs1  != cstrNE);
     EXPECT_FALSE(hs1 != stringE);
     EXPECT_TRUE(hs1  != stringNE);
-    EXPECT_FALSE(hs1 == stringNE);
+
+    EXPECT_TRUE(hs1 < hs2);
+    EXPECT_FALSE(hs2 < hs1);
+    EXPECT_TRUE(hs2 > hs1);
+    EXPECT_FALSE(hs1 > hs2);
+    EXPECT_TRUE(hs1 <= hs1);
+    EXPECT_TRUE(hs1 <= hs2);
+    EXPECT_FALSE(hs2 <= hs1);
+    EXPECT_TRUE(hs1 >= hs1);
+    EXPECT_TRUE(hs2 >= hs1);
+    EXPECT_FALSE(hs2 <= hs1);
 }
 
 TEST_F(LibHidlTest, MemoryTest) {
     using android::hardware::hidl_memory;
 
     hidl_memory mem1 = hidl_memory(); // default constructor
-    hidl_memory mem2 = mem1; // copy constructor (nullptr)
+    hidl_memory mem2 = mem1; // copy constructor (nullptr), NOLINT
 
     EXPECT_EQ(nullptr, mem2.handle());
 
     native_handle_t* testHandle = native_handle_create(0 /* numInts */, 0 /* numFds */);
 
     hidl_memory mem3 = hidl_memory("foo", testHandle, 42 /* size */); // owns testHandle
-    hidl_memory mem4 = mem3; // copy constructor (regular handle)
+    hidl_memory mem4 = mem3; // copy constructor (regular handle), NOLINT
 
     EXPECT_EQ(mem3.name(), mem4.name());
     EXPECT_EQ(mem3.size(), mem4.size());
@@ -131,7 +169,7 @@ TEST_F(LibHidlTest, MemoryTest) {
     EXPECT_NE(mem3.handle(), mem4.handle()); // check handle cloned
 
     hidl_memory mem5 = hidl_memory("foo", nullptr, 0); // hidl memory works with nullptr handle
-    hidl_memory mem6 = mem5;
+    hidl_memory mem6 = mem5; // NOLINT, test copying
     EXPECT_EQ(nullptr, mem5.handle());
     EXPECT_EQ(nullptr, mem6.handle());
 }
@@ -141,6 +179,9 @@ TEST_F(LibHidlTest, VecInitTest) {
     using std::vector;
     int32_t array[] = {5, 6, 7};
     vector<int32_t> v(array, array + 3);
+
+    hidl_vec<int32_t> hv0(3);  // size
+    EXPECT_EQ(hv0.size(), 3ul);  // cannot say anything about its contents
 
     hidl_vec<int32_t> hv1 = v; // copy =
     EXPECT_ARRAYEQ(hv1, array, 3);
@@ -225,6 +266,30 @@ TEST_F(LibHidlTest, VecEqTest) {
     EXPECT_TRUE(hv1 != hv3);
 }
 
+TEST_F(LibHidlTest, VecRangeCtorTest) {
+    struct ConvertibleType {
+        int val;
+
+        explicit ConvertibleType(int val) : val(val) {}
+        explicit operator int() const { return val; }
+        bool operator==(const int& other) const { return val == other; }
+    };
+
+    std::vector<ConvertibleType> input{
+        ConvertibleType(1), ConvertibleType(2), ConvertibleType(3),
+    };
+
+    android::hardware::hidl_vec<int> hv(input.begin(), input.end());
+
+    EXPECT_EQ(input.size(), hv.size());
+    int sum = 0;
+    for (unsigned i = 0; i < input.size(); i++) {
+        EXPECT_EQ(input[i], hv[i]);
+        sum += hv[i];
+    }
+    EXPECT_EQ(sum, 1 + 2 + 3);
+}
+
 TEST_F(LibHidlTest, ArrayTest) {
     using android::hardware::hidl_array;
     int32_t array[] = {5, 6, 7};
@@ -234,16 +299,24 @@ TEST_F(LibHidlTest, ArrayTest) {
 }
 
 TEST_F(LibHidlTest, TaskRunnerTest) {
-    using android::hardware::TaskRunner;
+    using android::hardware::details::TaskRunner;
+    using namespace std::chrono_literals;
+
+    std::condition_variable cv;
+    std::mutex m;
+
     TaskRunner tr;
+    tr.start(1 /* limit */);
     bool flag = false;
     tr.push([&] {
-        usleep(1000);
         flag = true;
+        cv.notify_all();
     });
-    usleep(500);
-    EXPECT_FALSE(flag);
-    usleep(1000);
+
+    std::unique_lock<std::mutex> lock(m);
+
+    // 1s so this doesn't deadlock. This isn't a performance test.
+    EXPECT_TRUE(cv.wait_for(lock, 1s, [&]{return flag;}));
     EXPECT_TRUE(flag);
 }
 
@@ -315,6 +388,61 @@ TEST_F(LibHidlTest, HidlVersionTest) {
     EXPECT_TRUE(v3_0 >= v2_2);
 }
 
+TEST_F(LibHidlTest, ReturnMoveTest) {
+    using namespace ::android;
+    using ::android::hardware::Return;
+    using ::android::hardware::Status;
+    Return<void> ret{Status::fromStatusT(DEAD_OBJECT)};
+    ret.isOk();
+    ret = {Status::fromStatusT(DEAD_OBJECT)};
+    ret.isOk();
+}
+
+TEST_F(LibHidlTest, ReturnTest) {
+    using ::android::DEAD_OBJECT;
+    using ::android::hardware::Return;
+    using ::android::hardware::Status;
+    using ::android::hardware::hidl_string;
+
+    EXPECT_FALSE(Return<void>(Status::fromStatusT(DEAD_OBJECT)).isOk());
+    EXPECT_TRUE(Return<void>(Status::ok()).isOk());
+
+    hidl_string one = "1";
+    hidl_string two = "2";
+    Return<hidl_string> ret = Return<hidl_string>(Status::fromStatusT(DEAD_OBJECT));
+
+    EXPECT_EQ(one, Return<hidl_string>(one).withDefault(two));
+    EXPECT_EQ(two, ret.withDefault(two));
+
+    hidl_string&& moved = ret.withDefault(std::move(two));
+    EXPECT_EQ("2", moved);
+
+    const hidl_string three = "3";
+    EXPECT_EQ(three, ret.withDefault(three));
+}
+
+std::string toString(const ::android::hardware::Status &s) {
+    using ::android::hardware::operator<<;
+    std::ostringstream oss;
+    oss << s;
+    return oss.str();
+}
+
+TEST_F(LibHidlTest, StatusStringTest) {
+    using namespace ::android;
+    using ::android::hardware::Status;
+    using ::testing::HasSubstr;
+
+    EXPECT_EQ(toString(Status::ok()), "No error");
+
+    EXPECT_THAT(toString(Status::fromStatusT(DEAD_OBJECT)), HasSubstr("DEAD_OBJECT"));
+
+    EXPECT_THAT(toString(Status::fromStatusT(-EBUSY)), HasSubstr("busy"));
+
+    EXPECT_THAT(toString(Status::fromExceptionCode(Status::EX_NULL_POINTER)),
+            HasSubstr("EX_NULL_POINTER"));
+
+}
 
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);

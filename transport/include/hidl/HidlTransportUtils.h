@@ -21,37 +21,19 @@
 
 namespace android {
 namespace hardware {
+namespace details {
 
 /*
  * Verifies the interface chain of 'interface' contains 'castTo'
+ * @param emitError if emitError is false, return Return<bool>{false} on error; if emitError
+ * is true, the Return<bool> object contains the actual error.
  */
-inline bool canCastInterface(::android::hidl::base::V1_0::IBase* interface, const char* castTo) {
-    if (interface == nullptr) {
-        return false;
-    }
+Return<bool> canCastInterface(::android::hidl::base::V1_0::IBase* interface,
+        const char* castTo, bool emitError = false);
 
-    bool canCast = false;
-    auto ret = interface->interfaceChain([&](const hidl_vec<hidl_string> &types) {
-        for (size_t i = 0; i < types.size(); i++) {
-            if (types[i] == castTo) {
-                canCast = true;
-                break;
-            }
-        }
-    });
-    return ret.isOk() && canCast;
-}
+std::string getDescriptor(::android::hidl::base::V1_0::IBase* interface);
 
-inline std::string getDescriptor(::android::hidl::base::V1_0::IBase* interface) {
-    std::string myDescriptor{};
-    auto ret = interface->interfaceChain([&](const hidl_vec<hidl_string> &types) {
-        if (types.size() > 0) {
-            myDescriptor = types[0].c_str();
-        }
-    });
-    return ret.isOk() ? myDescriptor : "";
-}
-
+}   // namespace details
 }   // namespace hardware
 }   // namespace android
 

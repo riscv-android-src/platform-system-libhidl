@@ -12,8 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-cc_library_shared {
+cc_library {
     name: "libhidlmemory",
+    vendor_available: true,
+    vndk: {
+        enabled: true,
+        support_system_process: true,
+    },
+    defaults: ["libhidl-defaults"],
     shared_libs: [
         "libbase",
         "liblog",

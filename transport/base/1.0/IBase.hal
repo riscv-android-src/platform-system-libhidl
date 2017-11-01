@@ -25,25 +25,46 @@ package android.hidl.base@1.0;
  *
  * Methods defined here are shared by all interfaces (this is like
  * java.lang.Object.notify(), for example.) However, the behavior of these
- * functions cannot be overridden.
+ * functions cannot be overridden (with the exception of the "debug" method).
  */
 interface IBase {
+
+    /*
+     * Provides way to determine if interface is running without requesting
+     * any functionality.
+     */
+    ping();
 
     /*
      * Provides run-time type information for this object.
      * For example, for the following interface definition:
      *     package android.hardware.foo@1.0;
      *     interface IParent {};
-     *     interface IChild {};
-     * Calling interfaceChain on an IChild object will yield the following:
+     *     interface IChild extends IParent {};
+     * Calling interfaceChain on an IChild object must yield the following:
      *     ["android.hardware.foo@1.0::IChild",
      *      "android.hardware.foo@1.0::IParent"
      *      "android.hidl.base@1.0::IBase"]
      *
-     * @return indicator a vector of descriptors of the run-time type of the
+     * @return descriptors a vector of descriptors of the run-time type of the
      *         object.
      */
-    interfaceChain() generates (vec<string> indicator);
+    interfaceChain() generates (vec<string> descriptors);
+
+    /*
+     * Provides run-time type information for this object.
+     * For example, for the following interface definition:
+     *     package android.hardware.foo@1.0;
+     *     interface IParent {};
+     *     interface IChild extends IParent {};
+     * Calling interfaceDescriptor on an IChild object must yield
+     *     "android.hardware.foo@1.0::IChild"
+     *
+     * @return descriptor a descriptor of the run-time type of the
+     *         object (the first element of the vector returned by
+     *         interfaceChain())
+     */
+    interfaceDescriptor() generates (string descriptor);
 
     /*
      * This method notifies the interface that one or more system properties
@@ -77,4 +98,41 @@ interface IBase {
      * on system property hal.instrumentation.enable.
      */
     oneway setHALInstrumentation();
+
+    /*
+     * Get debug information on references on this interface.
+     * @return info debugging information. See comments of DebugInfo.
+     */
+    getDebugInfo() generates (DebugInfo info);
+
+    /*
+     * Emit diagnostic information to the given file.
+     *
+     * Optionally overriden.
+     *
+     * @param fd      File descriptor to dump data to.
+     *                Must only be used for the duration of this call.
+     * @param options Arguments for debugging.
+     *                Must support empty for default debug information.
+     */
+    debug(handle fd, vec<string> options);
+
+    /*
+     * Returns hashes of the source HAL files that define the interfaces of the
+     * runtime type information on the object.
+     * For example, for the following interface definition:
+     *     package android.hardware.foo@1.0;
+     *     interface IParent {};
+     *     interface IChild extends IParent {};
+     * Calling interfaceChain on an IChild object must yield the following:
+     *     [(hash of IChild.hal),
+     *      (hash of IParent.hal)
+     *      (hash of IBase.hal)].
+     *
+     * SHA-256 is used as the hashing algorithm. Each hash has 32 bytes
+     * according to SHA-256 standard.
+     *
+     * @return hashchain a vector of SHA-1 digests
+     */
+    getHashChain() generates (vec<uint8_t[32]> hashchain);
 };

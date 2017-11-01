@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016 The Android Open Source Project
+ * Copyright (C) 2017 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,21 @@
  * limitations under the License.
  */
 
-package android.hidl.memory@1.0;
+#include <binder/IMemory.h>
+#include <hidl/HidlSupport.h>
+
+namespace android {
+
+namespace hardware {
 
 /**
- * Interface which allocates the required memory.
+ * Returns a new IMemory instance corresponding to a framework IMemoryHeap object.
+ * This encapsulates the idea that IMemoryHeap and the ashmem instance of hidl
+ * IMemory are backed by the same object.
+ *
+ * Return is never nullptr. May be an invalid hidl_memory object.
  */
-interface IAllocator {
+sp<HidlMemory> fromHeap(const sp<IMemoryHeap>& heap);
 
-    /**
-     * Return memory must have instance name corresponding to this type of memory.
-     *
-     * @param size Size of memory to allocate in bytes.
-     * @return success Whether allocation succeeded.
-     * @return memory Unmapped memory object.
-     */
-    allocate(uint64_t size) generates (bool success, memory mem);
-};
+}  // namespace hardware
+}  // namespace android

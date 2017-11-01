@@ -18,17 +18,39 @@
 
 #include <hidl/HidlBinderSupport.h>
 
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-#include <android-base/logging.h>
-#endif
+// C includes
+#include <unistd.h>
+
+// C++ includes
+#include <fstream>
+#include <sstream>
 
 namespace android {
 namespace hardware {
 
+hidl_binder_death_recipient::hidl_binder_death_recipient(const sp<hidl_death_recipient> &recipient,
+        uint64_t cookie, const sp<::android::hidl::base::V1_0::IBase> &base) :
+    mRecipient(recipient), mCookie(cookie), mBase(base) {
+}
+
+void hidl_binder_death_recipient::binderDied(const wp<IBinder>& /*who*/) {
+    sp<hidl_death_recipient> recipient = mRecipient.promote();
+    if (recipient != nullptr && mBase != nullptr) {
+        recipient->serviceDied(mCookie, mBase);
+    }
+    mBase = nullptr;
+}
+
+wp<hidl_death_recipient> hidl_binder_death_recipient::getRecipient() {
+    return mRecipient;
+}
+
 const size_t hidl_memory::kOffsetOfHandle = offsetof(hidl_memory, mHandle);
 const size_t hidl_memory::kOffsetOfName = offsetof(hidl_memory, mName);
+static_assert(hidl_memory::kOffsetOfHandle == 0, "wrong offset");
+static_assert(hidl_memory::kOffsetOfName == 24, "wrong offset");
 
-status_t readEmbeddedFromParcel(hidl_memory * /* memory */,
+status_t readEmbeddedFromParcel(const hidl_memory& memory,
         const Parcel &parcel, size_t parentHandle, size_t parentOffset) {
     const native_handle_t *handle;
     ::android::status_t _hidl_err = parcel.readNullableEmbeddedNativeHandle(
@@ -38,7 +60,7 @@ status_t readEmbeddedFromParcel(hidl_memory * /* memory */,
 
     if (_hidl_err == ::android::OK) {
         _hidl_err = readEmbeddedFromParcel(
-                (hidl_string*) nullptr,
+                memory.name(),
                 parcel,
                 parentHandle,
                 parentOffset + hidl_memory::kOffsetOfName);
@@ -64,17 +86,31 @@ status_t writeEmbeddedToParcel(const hidl_memory &memory,
 
     return _hidl_err;
 }
-// static
 const size_t hidl_string::kOffsetOfBuffer = offsetof(hidl_string, mBuffer);
+static_assert(hidl_string::kOffsetOfBuffer == 0, "wrong offset");
 
-status_t readEmbeddedFromParcel(hidl_string * /* string */,
+status_t readEmbeddedFromParcel(const hidl_string &string ,
         const Parcel &parcel, size_t parentHandle, size_t parentOffset) {
     const void *out;
-    return parcel.readEmbeddedBuffer(
+
+    status_t status = parcel.readEmbeddedBuffer(
+            string.size() + 1,
             nullptr /* buffer_handle */,
             parentHandle,
             parentOffset + hidl_string::kOffsetOfBuffer,
             &out);
+
+    if (status != OK) {
+        return status;
+    }
+
+    // Always safe to access out[string.size()] because we read size+1 bytes
+    if (static_cast<const char *>(out)[string.size()] != '\0') {
+        ALOGE("Received unterminated hidl_string buffer.");
+        return BAD_VALUE;
+    }
+
+    return OK;
 }
 
 status_t writeEmbeddedToParcel(const hidl_string &string,
@@ -103,7 +139,6 @@ hidl_version* readFromParcel(const android::hardware::Parcel& parcel) {
 
 status_t readFromParcel(Status *s, const Parcel& parcel) {
     int32_t exception;
-    int32_t errorCode;
     status_t status = parcel.readInt32(&exception);
     if (status != OK) {
         s->setFromStatusT(status);
@@ -139,19 +174,7 @@ status_t readFromParcel(Status *s, const Parcel& parcel) {
         return status;
     }
 
-    if (exception == Status::EX_SERVICE_SPECIFIC) {
-        status = parcel.readInt32(&errorCode);
-    }
-    if (status != OK) {
-        s->setFromStatusT(status);
-        return status;
-    }
-
-    if (exception == Status::EX_SERVICE_SPECIFIC) {
-        s->setServiceSpecificError(errorCode, String8(message));
-    } else {
-        s->setException(exception, String8(message));
-    }
+    s->setException(exception, String8(message));
 
     return status;
 }
@@ -170,12 +193,15 @@ status_t writeToParcel(const Status &s, Parcel* parcel) {
         return status;
     }
     status = parcel->writeString16(String16(s.exceptionMessage()));
-    if (s.exceptionCode() != Status::EX_SERVICE_SPECIFIC) {
-        // We have no more information to write.
-        return status;
-    }
-    status = parcel->writeInt32(s.serviceSpecificErrorCode());
     return status;
+}
+
+void configureBinderRpcThreadpool(size_t maxThreads, bool callerWillJoin) {
+    ProcessState::self()->setThreadPoolConfiguration(maxThreads, callerWillJoin /*callerJoinsPool*/);
+}
+
+void joinBinderRpcThreadpool() {
+    IPCThreadState::self()->joinThreadPool();
 }
 
 }  // namespace hardware

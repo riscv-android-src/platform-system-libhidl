@@ -17,11 +17,11 @@
 #ifndef _FMSGQ_DESCRIPTOR_H
 #define _FMSGQ_DESCRIPTOR_H
 
-#include <android-base/macros.h>
+#include <unistd.h>
+
 #include <cutils/native_handle.h>
+#include <hidl/HidlInternal.h>
 #include <hidl/HidlSupport.h>
-#include <utils/NativeHandle.h>
-#include <utils/Log.h>
 
 namespace android {
 namespace hardware {
@@ -29,11 +29,18 @@ namespace hardware {
 typedef uint64_t RingBufferPosition;
 
 struct GrantorDescriptor {
-    uint32_t flags;
-    uint32_t fdIndex;
-    uint32_t offset;
-    size_t extent;
+    uint32_t flags __attribute__ ((aligned(4)));
+    uint32_t fdIndex __attribute__ ((aligned(4)));
+    uint32_t offset __attribute__ ((aligned(4)));
+    uint64_t extent __attribute__ ((aligned(8)));
 };
+
+static_assert(offsetof(GrantorDescriptor, flags) == 0, "wrong offset");
+static_assert(offsetof(GrantorDescriptor, fdIndex) == 4, "wrong offset");
+static_assert(offsetof(GrantorDescriptor, offset) == 8, "wrong offset");
+static_assert(offsetof(GrantorDescriptor, extent) == 16, "wrong offset");
+static_assert(sizeof(GrantorDescriptor) == 24, "wrong size");
+static_assert(__alignof(GrantorDescriptor) == 8, "wrong alignment");
 
 enum MQFlavor : uint32_t {
   /*
@@ -73,8 +80,6 @@ struct MQDescriptor {
 
     bool isHandleValid() const { return mHandle != nullptr; }
     size_t countGrantors() const { return mGrantors.size(); }
-    std::vector<GrantorDescriptor> getGrantors() const;
-    const sp<NativeHandle> getNativeHandle() const;
 
     inline const ::android::hardware::hidl_vec<GrantorDescriptor> &grantors() const {
         return mGrantors;
@@ -112,7 +117,17 @@ struct MQDescriptor {
     //TODO(b/34160777) Identify a better solution that supports remoting.
     static inline size_t alignToWordBoundary(size_t length) {
         constexpr size_t kAlignmentSize = 64;
-        LOG_ALWAYS_FATAL_IF(kAlignmentSize % __WORDSIZE != 0, "Incompatible word size");
+        if (kAlignmentSize % __WORDSIZE != 0) {
+            details::logAlwaysFatal("Incompatible word size");
+        }
+
+        /*
+         * Check if alignment to word boundary would cause an overflow.
+         */
+        if (length > SIZE_MAX - kAlignmentSize/8 + 1) {
+            details::logAlwaysFatal("Queue size too large");
+        }
+
         return (length + kAlignmentSize/8 - 1) & ~(kAlignmentSize/8 - 1U);
     }
 
@@ -157,8 +172,9 @@ MQDescriptor<T, flavor>::MQDescriptor(
       mFlags(flavor) {
     mGrantors.resize(grantors.size());
     for (size_t i = 0; i < grantors.size(); ++i) {
-        LOG_ALWAYS_FATAL_IF(isAlignedToWordBoundary(grantors[i].offset) == false,
-                            "Grantor offsets need to be aligned");
+        if (isAlignedToWordBoundary(grantors[i].offset) == false) {
+            details::logAlwaysFatal("Grantor offsets need to be aligned");
+        }
         mGrantors[i] = grantors[i];
     }
 }
@@ -243,22 +259,22 @@ template<typename T, MQFlavor flavor>
 int32_t MQDescriptor<T, flavor>::getFlags() const { return mFlags; }
 
 template<typename T, MQFlavor flavor>
-std::vector<GrantorDescriptor> MQDescriptor<T, flavor>::getGrantors() const {
-  size_t grantor_count = mGrantors.size();
-  std::vector<GrantorDescriptor> grantors(grantor_count);
-  for (size_t i = 0; i < grantor_count; i++) {
-    grantors[i] = mGrantors[i];
-  }
-  return grantors;
+std::string toString(const MQDescriptor<T, flavor> &q) {
+    std::string os;
+    if (flavor & kSynchronizedReadWrite) {
+        os += "fmq_sync";
+    }
+    if (flavor & kUnsynchronizedWrite) {
+        os += "fmq_unsync";
+    }
+    os += " {"
+       + toString(q.grantors().size()) + " grantor(s), "
+       + "size = " + toString(q.getSize())
+       + ", .handle = " + toString(q.handle())
+       + ", .quantum = " + toString(q.getQuantum()) + "}";
+    return os;
 }
 
-template<typename T, MQFlavor flavor>
-const sp<NativeHandle> MQDescriptor<T, flavor>::getNativeHandle() const {
-  /*
-   * Create an sp<NativeHandle> from mHandle.
-   */
-  return NativeHandle::create(mHandle, false /* ownsHandle */);
-}
 }  // namespace hardware
 }  // namespace android
 

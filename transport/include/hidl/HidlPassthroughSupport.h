@@ -21,14 +21,31 @@
 
 namespace android {
 namespace hardware {
+namespace details {
 
 /*
- * Wrap the given interface with the smallest BsChild possible. Will return the
+ * Wrap the given interface with the lowest BsChild possible. Will return the
  * argument directly if nullptr or isRemote().
+ *
+ * Note that 'static_cast<IFoo*>(wrapPassthrough(foo).get()) is guaranteed to work'
+ * assuming that foo is an instance of IFoo.
+ *
+ * TODO(b/33754152): calling this method multiple times should not re-wrap.
  */
-sp<::android::hidl::base::V1_0::IBase> wrapPassthrough(
-        sp<::android::hidl::base::V1_0::IBase> iface);
+sp<::android::hidl::base::V1_0::IBase> wrapPassthroughInternal(
+    sp<::android::hidl::base::V1_0::IBase> iface);
 
+/**
+ * Helper method which provides reasonable code to wrapPassthroughInternal
+ * which can be used to call wrapPassthrough.
+ */
+template <typename IType,
+          typename = std::enable_if_t<std::is_same<i_tag, typename IType::_hidl_tag>::value>>
+sp<IType> wrapPassthrough(sp<IType> iface) {
+    return static_cast<IType*>(wrapPassthroughInternal(iface).get());
+}
+
+}  // namespace details
 }  // namespace hardware
 }  // namespace android
 

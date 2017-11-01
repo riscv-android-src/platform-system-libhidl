@@ -19,15 +19,12 @@
 
 #include <algorithm>
 #include <array>
-#include <dirent.h>
-#include <dlfcn.h>
 #include <iterator>
 #include <cutils/native_handle.h>
-#include <cutils/properties.h>
-#include <functional>
 #include <hidl/HidlInternal.h>
 #include <hidl/Status.h>
 #include <map>
+#include <sstream>
 #include <stddef.h>
 #include <tuple>
 #include <type_traits>
@@ -58,6 +55,11 @@ namespace V1_0 {
 
 namespace hardware {
 
+namespace details {
+// Return true on userdebug / eng builds and false on user builds.
+bool debuggable();
+} //  namespace details
+
 // hidl_death_recipient is a callback interfaced that can be used with
 // linkToDeath() / unlinkToDeath()
 struct hidl_death_recipient : public virtual RefBase {
@@ -67,57 +69,54 @@ struct hidl_death_recipient : public virtual RefBase {
 
 // hidl_handle wraps a pointer to a native_handle_t in a hidl_pointer,
 // so that it can safely be transferred between 32-bit and 64-bit processes.
+// The ownership semantics for this are:
+// 1) The conversion constructor and assignment operator taking a const native_handle_t*
+//    do not take ownership of the handle; this is because these operations are usually
+//    just done for IPC, and cloning by default is a waste of resources. If you want
+//    a hidl_handle to take ownership, call setTo(handle, true /*shouldOwn*/);
+// 2) The copy constructor/assignment operator taking a hidl_handle *DO* take ownership;
+//    that is because it's not intuitive that this class encapsulates a native_handle_t
+//    which needs cloning to be valid; in particular, this allows constructs like this:
+//    hidl_handle copy;
+//    foo->someHidlCall([&](auto incoming_handle) {
+//            copy = incoming_handle;
+//    });
+//    // copy and its enclosed file descriptors will remain valid here.
+// 3) The move constructor does what you would expect; it only owns the handle if the
+//    original did.
 struct hidl_handle {
-    hidl_handle() {
-        mHandle = nullptr;
-    }
-    ~hidl_handle() {
-    }
+    hidl_handle();
+    ~hidl_handle();
 
-    // copy constructors.
-    hidl_handle(const native_handle_t *handle) {
-        mHandle = handle;
-    }
+    hidl_handle(const native_handle_t *handle);
 
-    hidl_handle(const hidl_handle &other) {
-        mHandle = other.mHandle;
-    }
+    // copy constructor.
+    hidl_handle(const hidl_handle &other);
 
     // move constructor.
-    hidl_handle(hidl_handle &&other) {
-        *this = std::move(other);
-    }
+    hidl_handle(hidl_handle &&other) noexcept;
 
-    // assingment operators
-    hidl_handle &operator=(const hidl_handle &other) {
-        mHandle = other.mHandle;
-        return *this;
-    }
+    // assignment operators
+    hidl_handle &operator=(const hidl_handle &other);
 
-    hidl_handle &operator=(const native_handle_t *native_handle) {
-        mHandle = native_handle;
-        return *this;
-    }
+    hidl_handle &operator=(const native_handle_t *native_handle);
 
-    hidl_handle &operator=(hidl_handle &&other) {
-        mHandle = other.mHandle;
-        other.mHandle = nullptr;
-        return *this;
-    }
+    hidl_handle &operator=(hidl_handle &&other) noexcept;
 
-    const native_handle_t* operator->() const {
-        return mHandle;
-    }
+    void setTo(native_handle_t* handle, bool shouldOwn = false);
+
+    const native_handle_t* operator->() const;
+
     // implicit conversion to const native_handle_t*
-    operator const native_handle_t *() const {
-        return mHandle;
-    }
+    operator const native_handle_t *() const;
+
     // explicit conversion
-    const native_handle_t *getNativeHandle() const {
-        return mHandle;
-    }
+    const native_handle_t *getNativeHandle() const;
 private:
-    details::hidl_pointer<const native_handle_t> mHandle;
+    void freeHandle();
+
+    details::hidl_pointer<const native_handle_t> mHandle __attribute__ ((aligned(8)));
+    bool mOwnsHandle __attribute ((aligned(8)));
 };
 
 struct hidl_string {
@@ -126,7 +125,7 @@ struct hidl_string {
 
     // copy constructor.
     hidl_string(const hidl_string &);
-    // copy from a C-style string.
+    // copy from a C-style string. nullptr will create an empty string
     hidl_string(const char *);
     // copy the first length characters from a C-style string.
     hidl_string(const char *, size_t length);
@@ -134,7 +133,7 @@ struct hidl_string {
     hidl_string(const std::string &);
 
     // move constructor.
-    hidl_string(hidl_string &&);
+    hidl_string(hidl_string &&) noexcept;
 
     const char *c_str() const;
     size_t size() const;
@@ -147,12 +146,9 @@ struct hidl_string {
     // copy from an std::string.
     hidl_string &operator=(const std::string &);
     // move assignment operator.
-    hidl_string &operator=(hidl_string &&other);
+    hidl_string &operator=(hidl_string &&other) noexcept;
     // cast to std::string.
     operator std::string() const;
-    // cast to C-style string. Caller is responsible
-    // to maintain this hidl_string alive.
-    operator const char *() const;
 
     void clear();
 
@@ -176,29 +172,30 @@ private:
     void moveFrom(hidl_string &&);
 };
 
-inline bool operator==(const hidl_string &hs1, const hidl_string &hs2) {
-    return strcmp(hs1.c_str(), hs2.c_str()) == 0;
-}
+// Use NOLINT to suppress missing parentheses warnings around OP.
+#define HIDL_STRING_OPERATOR(OP)                                               \
+    inline bool operator OP(const hidl_string &hs1, const hidl_string &hs2) {  \
+        return strcmp(hs1.c_str(), hs2.c_str()) OP 0;     /* NOLINT */         \
+    }                                                                          \
+    inline bool operator OP(const hidl_string &hs, const char *s) {            \
+        return strcmp(hs.c_str(), s) OP 0;                /* NOLINT */         \
+    }                                                                          \
+    inline bool operator OP(const char *s, const hidl_string &hs) {            \
+        return strcmp(hs.c_str(), s) OP 0;                /* NOLINT */         \
+    }
 
-inline bool operator!=(const hidl_string &hs1, const hidl_string &hs2) {
-    return !(hs1 == hs2);
-}
+HIDL_STRING_OPERATOR(==)
+HIDL_STRING_OPERATOR(!=)
+HIDL_STRING_OPERATOR(<)
+HIDL_STRING_OPERATOR(<=)
+HIDL_STRING_OPERATOR(>)
+HIDL_STRING_OPERATOR(>=)
 
-inline bool operator==(const hidl_string &hs, const char *s) {
-    return strcmp(hs.c_str(), s) == 0;
-}
+#undef HIDL_STRING_OPERATOR
 
-inline bool operator!=(const hidl_string &hs, const char *s) {
-    return !(hs == s);
-}
+// Send our content to the output stream
+std::ostream& operator<<(std::ostream& os, const hidl_string& str);
 
-inline bool operator==(const char *s, const hidl_string &hs) {
-    return strcmp(hs.c_str(), s) == 0;
-}
-
-inline bool operator!=(const char *s, const hidl_string &hs) {
-    return !(s == hs);
-}
 
 // hidl_memory is a structure that can be used to transfer
 // pieces of shared memory between processes. The assumption
@@ -207,15 +204,24 @@ inline bool operator!=(const char *s, const hidl_string &hs) {
 // - as well as all of its cross-process dups() - remain opened.
 struct hidl_memory {
 
-    hidl_memory() : mOwnsHandle(false), mHandle(nullptr), mSize(0), mName("") {
+    hidl_memory() : mHandle(nullptr), mSize(0), mName("") {
     }
 
     /**
-     * Creates a hidl_memory object and takes ownership of the handle.
+     * Creates a hidl_memory object whose handle has the same lifetime
+     * as the handle moved into it.
      */
-    hidl_memory(const hidl_string &name, const hidl_handle &handle, size_t size)
-       : mOwnsHandle(true),
-         mHandle(handle),
+    hidl_memory(const hidl_string& name, hidl_handle&& handle, size_t size)
+        : mHandle(std::move(handle)), mSize(size), mName(name) {}
+
+    /**
+     * Creates a hidl_memory object, but doesn't take ownership of
+     * the passed in native_handle_t; callers are responsible for
+     * making sure the handle remains valid while this object is
+     * used.
+     */
+    hidl_memory(const hidl_string &name, const native_handle_t *handle, size_t size)
+      :  mHandle(handle),
          mSize(size),
          mName(name)
     {}
@@ -228,15 +234,7 @@ struct hidl_memory {
     // copy assignment
     hidl_memory &operator=(const hidl_memory &other) {
         if (this != &other) {
-            cleanup();
-
-            if (other.mHandle == nullptr) {
-                mHandle = nullptr;
-                mOwnsHandle = false;
-            } else {
-                mOwnsHandle = true;
-                mHandle = native_handle_clone(other.mHandle);
-            }
+            mHandle = other.mHandle;
             mSize = other.mSize;
             mName = other.mName;
         }
@@ -244,10 +242,25 @@ struct hidl_memory {
         return *this;
     }
 
-    // TODO move constructor/move assignment
+    // move constructor
+    hidl_memory(hidl_memory&& other) noexcept {
+        *this = std::move(other);
+    }
+
+    // move assignment
+    hidl_memory &operator=(hidl_memory &&other) noexcept {
+        if (this != &other) {
+            mHandle = std::move(other.mHandle);
+            mSize = other.mSize;
+            mName = std::move(other.mName);
+            other.mSize = 0;
+        }
+
+        return *this;
+    }
+
 
     ~hidl_memory() {
-        cleanup();
     }
 
     const native_handle_t* handle() const {
@@ -258,9 +271,12 @@ struct hidl_memory {
         return mName;
     }
 
-    size_t size() const {
+    uint64_t size() const {
         return mSize;
     }
+
+    // @return true if it's valid
+    inline bool valid() const { return handle() != nullptr; }
 
     // offsetof(hidl_memory, mHandle) exposed since mHandle is private.
     static const size_t kOffsetOfHandle;
@@ -268,34 +284,54 @@ struct hidl_memory {
     static const size_t kOffsetOfName;
 
 private:
-    bool mOwnsHandle;
-    hidl_handle mHandle;
-    size_t mSize;
-    hidl_string mName;
-
-    void cleanup() {
-        // TODO(b/33812533): native_handle_delete
-        if (mOwnsHandle && mHandle != nullptr) {
-            native_handle_close(mHandle);
-        }
-    }
+    hidl_handle mHandle __attribute__ ((aligned(8)));
+    uint64_t mSize __attribute__ ((aligned(8)));
+    hidl_string mName __attribute__ ((aligned(8)));
 };
 
+// HidlMemory is a wrapper class to support sp<> for hidl_memory. It also
+// provides factory methods to create an instance from hidl_memory or
+// from a opened file descriptor. The number of factory methods can be increase
+// to support other type of hidl_memory without break the ABI.
+class HidlMemory : public virtual hidl_memory, public virtual ::android::RefBase {
+public:
+    static sp<HidlMemory> getInstance(hidl_memory&& mem);
+
+    static sp<HidlMemory> getInstance(const hidl_string& name, hidl_handle&& handle, uint64_t size);
+    // @param fd, shall be opened and points to the resource.
+    // @note this method takes the ownership of the fd and will close it in
+    //     destructor
+    static sp<HidlMemory> getInstance(const hidl_string& name, int fd, uint64_t size);
+
+protected:
+    HidlMemory() : hidl_memory() {}
+    HidlMemory(const hidl_string& name, hidl_handle&& handle, size_t size)
+        : hidl_memory(name, std::move(handle), size) {}
+    ~HidlMemory();
+    HidlMemory& operator=(hidl_memory&& src) {
+        hidl_memory::operator=(src);
+        return *this;
+    }
+};
 ////////////////////////////////////////////////////////////////////////////////
 
 template<typename T>
-struct hidl_vec : private details::hidl_log_base {
+struct hidl_vec {
     hidl_vec()
-        : mBuffer(NULL),
+        : mBuffer(nullptr),
           mSize(0),
           mOwnsBuffer(true) {
+        static_assert(hidl_vec<T>::kOffsetOfBuffer == 0, "wrong offset");
     }
+
+    // Note, does not initialize primitive types.
+    hidl_vec(size_t size) : hidl_vec() { resize(size); }
 
     hidl_vec(const hidl_vec<T> &other) : hidl_vec() {
         *this = other;
     }
 
-    hidl_vec(hidl_vec<T> &&other)
+    hidl_vec(hidl_vec<T> &&other) noexcept
     : mOwnsBuffer(false) {
         *this = std::move(other);
     }
@@ -303,7 +339,7 @@ struct hidl_vec : private details::hidl_log_base {
     hidl_vec(const std::initializer_list<T> list)
             : mOwnsBuffer(true) {
         if (list.size() > UINT32_MAX) {
-            logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
+            details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
         }
         mSize = static_cast<uint32_t>(list.size());
         mBuffer = new T[mSize];
@@ -318,11 +354,32 @@ struct hidl_vec : private details::hidl_log_base {
         *this = other;
     }
 
+    template <typename InputIterator,
+              typename = typename std::enable_if<std::is_convertible<
+                  typename std::iterator_traits<InputIterator>::iterator_category,
+                  std::input_iterator_tag>::value>::type>
+    hidl_vec(InputIterator first, InputIterator last) : mOwnsBuffer(true) {
+        auto size = std::distance(first, last);
+        if (size > static_cast<int64_t>(UINT32_MAX)) {
+            details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
+        }
+        if (size < 0) {
+            details::logAlwaysFatal("size can't be negative.");
+        }
+        mSize = static_cast<uint32_t>(size);
+        mBuffer = new T[mSize];
+
+        size_t idx = 0;
+        for (; first != last; ++first) {
+            mBuffer[idx++] = static_cast<T>(*first);
+        }
+    }
+
     ~hidl_vec() {
         if (mOwnsBuffer) {
             delete[] mBuffer;
         }
-        mBuffer = NULL;
+        mBuffer = nullptr;
     }
 
     // Reference an existing array, optionally taking ownership. It is the
@@ -334,7 +391,7 @@ struct hidl_vec : private details::hidl_log_base {
         }
         mBuffer = data;
         if (size > UINT32_MAX) {
-            logAlwaysFatal("external vector size exceeds 2^32 elements.");
+            details::logAlwaysFatal("external vector size exceeds 2^32 elements.");
         }
         mSize = static_cast<uint32_t>(size);
         mOwnsBuffer = shouldOwn;
@@ -356,7 +413,7 @@ struct hidl_vec : private details::hidl_log_base {
         return mBuffer;
     }
 
-    hidl_vec &operator=(hidl_vec &&other) {
+    hidl_vec &operator=(hidl_vec &&other) noexcept {
         if (mOwnsBuffer) {
             delete[] mBuffer;
         }
@@ -426,9 +483,10 @@ struct hidl_vec : private details::hidl_log_base {
         return mBuffer[index];
     }
 
+    // Does not initialize primitive types if new size > old size.
     void resize(size_t size) {
         if (size > UINT32_MAX) {
-            logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
+            details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
         }
         T *newBuffer = new T[size];
 
@@ -511,7 +569,7 @@ private:
                 mBuffer[i] = data[i];
             }
         } else {
-            mBuffer = NULL;
+            mBuffer = nullptr;
         }
     }
 };
@@ -601,7 +659,7 @@ namespace details {
             : mBase(base) {
         }
 
-        const_accessor<T, SIZES...> operator[](size_t index) {
+        const_accessor<T, SIZES...> operator[](size_t index) const {
             return const_accessor<T, SIZES...>(
                     &mBase[index * product<SIZES...>::value]);
         }
@@ -811,78 +869,120 @@ inline android::hardware::hidl_version make_hidl_version(uint16_t major, uint16_
     return hidl_version(major,minor);
 }
 
-#if defined(__LP64__)
-#define HAL_LIBRARY_PATH_SYSTEM "/system/lib64/hw/"
-#define HAL_LIBRARY_PATH_VENDOR "/vendor/lib64/hw/"
-#define HAL_LIBRARY_PATH_ODM "/odm/lib64/hw/"
-#else
-#define HAL_LIBRARY_PATH_SYSTEM "/system/lib/hw/"
-#define HAL_LIBRARY_PATH_VENDOR "/vendor/lib/hw/"
-#define HAL_LIBRARY_PATH_ODM "/odm/lib/hw/"
-#endif
+///////////////////// toString functions
 
-// ----------------------------------------------------------------------
-// Class that provides Hidl instrumentation utilities.
-struct HidlInstrumentor {
-    // Event that triggers the instrumentation. e.g. enter of an API call on
-    // the server/client side, exit of an API call on the server/client side
-    // etc.
-    enum InstrumentationEvent {
-        SERVER_API_ENTRY = 0,
-        SERVER_API_EXIT,
-        CLIENT_API_ENTRY,
-        CLIENT_API_EXIT,
-        SYNC_CALLBACK_ENTRY,
-        SYNC_CALLBACK_EXIT,
-        ASYNC_CALLBACK_ENTRY,
-        ASYNC_CALLBACK_EXIT,
-        PASSTHROUGH_ENTRY,
-        PASSTHROUGH_EXIT,
-    };
+std::string toString(const void *t);
 
-    // Signature of the instrumentation callback function.
-    using InstrumentationCallback = std::function<void(
-            const InstrumentationEvent event,
-            const char *package,
-            const char *version,
-            const char *interface,
-            const char *method,
-            std::vector<void *> *args)>;
+// toString alias for numeric types
+template<typename T, typename = typename std::enable_if<std::is_arithmetic<T>::value, T>::type>
+inline std::string toString(T t) {
+    return std::to_string(t);
+}
 
-    explicit HidlInstrumentor(const std::string &prefix);
-    virtual ~HidlInstrumentor();
+namespace details {
 
- protected:
-    // Set mEnableInstrumentation based on system property
-    // hal.instrumentation.enable, register/de-register instrumentation
-    // callbacks if mEnableInstrumentation is true/false.
-    void configureInstrumentation(bool log=true);
-    // Function that lookup and dynamically loads the hidl instrumentation
-    // libraries and registers the instrumentation callback functions.
-    //
-    // The instrumentation libraries should be stored under any of the following
-    // directories: HAL_LIBRARY_PATH_SYSTEM, HAL_LIBRARY_PATH_VENDOR and
-    // HAL_LIBRARY_PATH_ODM. The name of instrumentation libraries should
-    // follow pattern: ^profilerPrefix(.*).profiler.so$
-    //
-    // Each instrumentation library is expected to implement the instrumentation
-    // function called HIDL_INSTRUMENTATION_FUNCTION.
-    //
-    // A no-op for user build.
-    void registerInstrumentationCallbacks(
-            std::vector<InstrumentationCallback> *instrumentationCallbacks);
+template<typename T, typename = typename std::enable_if<std::is_arithmetic<T>::value, T>::type>
+inline std::string toHexString(T t, bool prefix = true) {
+    std::ostringstream os;
+    if (prefix) { os << std::showbase; }
+    os << std::hex << t;
+    return os.str();
+}
 
-    // Utility function to determine whether a give file is a instrumentation
-    // library (i.e. the file name follow the expected pattern).
-    bool isInstrumentationLib(const dirent *file);
+template<>
+inline std::string toHexString(uint8_t t, bool prefix) {
+    return toHexString(static_cast<int32_t>(t), prefix);
+}
 
-    // A list of registered instrumentation callbacks.
-    std::vector<InstrumentationCallback> mInstrumentationCallbacks;
-    // Flag whether to enable instrumentation.
-    bool mEnableInstrumentation;
-    // Prefix to lookup the instrumentation libraries.
-    std::string mInstrumentationLibPrefix;
-};
+template<>
+inline std::string toHexString(int8_t t, bool prefix) {
+    return toHexString(static_cast<int32_t>(t), prefix);
+}
+
+template<typename Array>
+std::string arrayToString(const Array &a, size_t size);
+
+template<size_t SIZE1>
+std::string arraySizeToString() {
+    return std::string{"["} + toString(SIZE1) + "]";
+}
+
+template<size_t SIZE1, size_t SIZE2, size_t... SIZES>
+std::string arraySizeToString() {
+    return std::string{"["} + toString(SIZE1) + "]" + arraySizeToString<SIZE2, SIZES...>();
+}
+
+template<typename T, size_t SIZE1>
+std::string toString(details::const_accessor<T, SIZE1> a) {
+    return arrayToString(a, SIZE1);
+}
+
+template<typename Array>
+std::string arrayToString(const Array &a, size_t size) {
+    using android::hardware::toString;
+    std::string os;
+    os += "{";
+    for (size_t i = 0; i < size; ++i) {
+        if (i > 0) {
+            os += ", ";
+        }
+        os += toString(a[i]);
+    }
+    os += "}";
+    return os;
+}
+
+template<typename T, size_t SIZE1, size_t SIZE2, size_t... SIZES>
+std::string toString(details::const_accessor<T, SIZE1, SIZE2, SIZES...> a) {
+    return arrayToString(a, SIZE1);
+}
+
+}  //namespace details
+
+inline std::string toString(const void *t) {
+    return details::toHexString(reinterpret_cast<uintptr_t>(t));
+}
+
+// debug string dump. There will be quotes around the string!
+inline std::string toString(const hidl_string &hs) {
+    return std::string{"\""} + hs.c_str() + "\"";
+}
+
+// debug string dump
+inline std::string toString(const hidl_handle &hs) {
+    return toString(hs.getNativeHandle());
+}
+
+inline std::string toString(const hidl_memory &mem) {
+    return std::string{"memory {.name = "} + toString(mem.name()) + ", .size = "
+              + toString(mem.size())
+              + ", .handle = " + toString(mem.handle()) + "}";
+}
+
+inline std::string toString(const sp<hidl_death_recipient> &dr) {
+    return std::string{"death_recipient@"} + toString(dr.get());
+}
+
+// debug string dump, assuming that toString(T) is defined.
+template<typename T>
+std::string toString(const hidl_vec<T> &a) {
+    std::string os;
+    os += "[" + toString(a.size()) + "]";
+    os += details::arrayToString(a, a.size());
+    return os;
+}
+
+template<typename T, size_t SIZE1>
+std::string toString(const hidl_array<T, SIZE1> &a) {
+    return details::arraySizeToString<SIZE1>()
+            + details::toString(details::const_accessor<T, SIZE1>(a.data()));
+}
+
+template<typename T, size_t SIZE1, size_t SIZE2, size_t... SIZES>
+std::string toString(const hidl_array<T, SIZE1, SIZE2, SIZES...> &a) {
+    return details::arraySizeToString<SIZE1, SIZE2, SIZES...>()
+            + details::toString(details::const_accessor<T, SIZE1, SIZE2, SIZES...>(a.data()));
+}
 
 }  // namespace hardware
 }  // namespace android
