@@ -16,6 +16,8 @@
 #include <hidl/HidlTransportSupport.h>
 #include <hidl/HidlBinderSupport.h>
 
+#include <android/hidl/manager/1.0/IServiceManager.h>
+
 namespace android {
 namespace hardware {
 
@@ -52,6 +54,17 @@ bool setMinSchedulerPolicy(const sp<::android::hidl::base::V1_0::IBase>& service
 
     return true;
 }
+
+namespace details {
+int32_t getPidIfSharable() {
+#if LIBHIDL_TARGET_DEBUGGABLE
+    return getpid();
+#else
+    using android::hidl::manager::V1_0::IServiceManager;
+    return static_cast<int32_t>(IServiceManager::PidConstant::NO_PID);
+#endif
+}
+}  // namespace details
 
 }  // namespace hardware
 }  // namespace android
