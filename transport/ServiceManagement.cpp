@@ -30,6 +30,7 @@
 
 #include <hidl/HidlBinderSupport.h>
 #include <hidl/HidlInternal.h>
+#include <hidl/HidlTransportUtils.h>
 #include <hidl/ServiceManagement.h>
 #include <hidl/Status.h>
 
@@ -357,7 +358,12 @@ struct PassthroughServiceManager : IServiceManager1_1 {
                 return true; // this module doesn't provide this instance name
             }
 
-            registerReference(fqName, name);
+            // Actual fqname might be a subclass.
+            // This assumption is tested in vts_treble_vintf_test
+            using ::android::hardware::details::getDescriptor;
+            std::string actualFqName = getDescriptor(ret.get());
+            CHECK(actualFqName.size() > 0);
+            registerReference(actualFqName, name);
             return false;
         });
 
@@ -485,8 +491,7 @@ struct Waiter : IServiceNotification {
         // that thread, it will block forever because we hung up the one and only
         // binder thread on a condition variable that can only be notified by an
         // incoming binder call.
-        if (ProcessState::self()->getMaxThreads() <= 1 &&
-                IPCThreadState::self()->isLooperThread()) {
+        if (IPCThreadState::self()->isOnlyBinderThread()) {
             LOG(WARNING) << "Can't efficiently wait for " << mInterfaceName << "/"
                          << mInstanceName << ", because we are called from "
                          << "the only binder thread in this process.";
@@ -512,12 +517,9 @@ struct Waiter : IServiceNotification {
     }
 
     ~Waiter() {
-        if (mRegisteredForNotifications) {
-            if (!mSm->unregisterForNotifications(mInterfaceName, mInstanceName, this).
-                    withDefault(false)) {
-                LOG(ERROR) << "Could not unregister service notification for "
-                    << mInterfaceName << "/" << mInstanceName << ".";
-            }
+        if (!mDoneCalled) {
+            LOG(FATAL)
+                << "Waiter still registered for notifications, call done() before dropping ref!";
         }
     }
 
@@ -535,7 +537,7 @@ struct Waiter : IServiceNotification {
         return Void();
     }
 
-    void wait() {
+    void wait(bool timeout) {
         using std::literals::chrono_literals::operator""s;
 
         if (!mRegisteredForNotifications) {
@@ -546,7 +548,7 @@ struct Waiter : IServiceNotification {
         }
 
         std::unique_lock<std::mutex> lock(mMutex);
-        while(true) {
+        do {
             mCondition.wait_for(lock, 1s, [this]{
                 return mRegistered;
             });
@@ -555,9 +557,8 @@ struct Waiter : IServiceNotification {
                 break;
             }
 
-            LOG(WARNING) << "Waited one second for " << mInterfaceName << "/" << mInstanceName
-                         << ". Waiting another...";
-        }
+            LOG(WARNING) << "Waited one second for " << mInterfaceName << "/" << mInstanceName;
+        } while (!timeout);
     }
 
     // Be careful when using this; after calling reset(), you must always try to retrieve
@@ -568,7 +569,23 @@ struct Waiter : IServiceNotification {
         std::unique_lock<std::mutex> lock(mMutex);
         mRegistered = false;
     }
-private:
+
+    // done() must be called before dropping the last strong ref to the Waiter, to make
+    // sure we can properly unregister with hwservicemanager.
+    void done() {
+        if (mRegisteredForNotifications) {
+            if (!mSm->unregisterForNotifications(mInterfaceName, mInstanceName, this)
+                     .withDefault(false)) {
+                LOG(ERROR) << "Could not unregister service notification for " << mInterfaceName
+                           << "/" << mInstanceName << ".";
+            } else {
+                mRegisteredForNotifications = false;
+            }
+        }
+        mDoneCalled = true;
+    }
+
+   private:
     const std::string mInterfaceName;
     const std::string mInstanceName;
     const sp<IServiceManager1_1>& mSm;
@@ -576,12 +593,14 @@ private:
     std::condition_variable mCondition;
     bool mRegistered = false;
     bool mRegisteredForNotifications = false;
+    bool mDoneCalled = false;
 };
 
 void waitForHwService(
         const std::string &interface, const std::string &instanceName) {
     sp<Waiter> waiter = new Waiter(interface, instanceName, defaultServiceManager1_1());
-    waiter->wait();
+    waiter->wait(false /* timeout */);
+    waiter->done();
 }
 
 // Prints relevant error/warning messages for error return values from
@@ -621,6 +640,7 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
     using Transport = ::android::hidl::manager::V1_0::IServiceManager::Transport;
     using ::android::hidl::base::V1_0::IBase;
     using ::android::hidl::manager::V1_0::IServiceManager;
+    sp<Waiter> waiter;
 
     const sp<IServiceManager1_1> sm = defaultServiceManager1_1();
     if (sm == nullptr) {
@@ -639,26 +659,30 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
     const bool vintfHwbinder = (transport == Transport::HWBINDER);
     const bool vintfPassthru = (transport == Transport::PASSTHROUGH);
 
-#ifdef LIBHIDL_TARGET_TREBLE
+#ifdef ENFORCE_VINTF_MANIFEST
 
 #ifdef LIBHIDL_TARGET_DEBUGGABLE
     const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
     const bool trebleTestingOverride = env && !strcmp(env, "true");
     const bool vintfLegacy = (transport == Transport::EMPTY) && trebleTestingOverride;
-#else   // LIBHIDL_TARGET_TREBLE but not LIBHIDL_TARGET_DEBUGGABLE
+#else   // ENFORCE_VINTF_MANIFEST but not LIBHIDL_TARGET_DEBUGGABLE
     const bool trebleTestingOverride = false;
     const bool vintfLegacy = false;
 #endif  // LIBHIDL_TARGET_DEBUGGABLE
 
-#else   // not LIBHIDL_TARGET_TREBLE
+#else   // not ENFORCE_VINTF_MANIFEST
     const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
     const bool trebleTestingOverride = env && !strcmp(env, "true");
     const bool vintfLegacy = (transport == Transport::EMPTY);
-#endif  // LIBHIDL_TARGET_TREBLE
+#endif  // ENFORCE_VINTF_MANIFEST
 
-    sp<Waiter> waiter = new Waiter(descriptor, instance, sm);
-    while (!getStub && (vintfHwbinder || vintfLegacy)) {
-        waiter->reset(); // don't reorder this -- see comments on reset()
+    for (int tries = 0; !getStub && (vintfHwbinder || vintfLegacy); tries++) {
+        if (waiter == nullptr && tries > 0) {
+            waiter = new Waiter(descriptor, instance, sm);
+        }
+        if (waiter != nullptr) {
+            waiter->reset();  // don't reorder this -- see comments on reset()
+        }
         Return<sp<IBase>> ret = sm->get(descriptor, instance);
         if (!ret.isOk()) {
             ALOGE("getService: defaultServiceManager()->get returns %s for %s/%s.",
@@ -671,6 +695,9 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
                 details::canCastInterface(base.get(), descriptor.c_str(), true /* emitError */);
 
             if (canCastRet.isOk() && canCastRet) {
+                if (waiter != nullptr) {
+                    waiter->done();
+                }
                 return base; // still needs to be wrapped by Bp class.
             }
 
@@ -680,8 +707,14 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
         // In case of legacy or we were not asked to retry, don't.
         if (vintfLegacy || !retry) break;
 
-        ALOGI("getService: Trying again for %s/%s...", descriptor.c_str(), instance.c_str());
-        waiter->wait();
+        if (waiter != nullptr) {
+            ALOGI("getService: Trying again for %s/%s...", descriptor.c_str(), instance.c_str());
+            waiter->wait(true /* timeout */);
+        }
+    }
+
+    if (waiter != nullptr) {
+        waiter->done();
     }
 
     if (getStub || vintfPassthru || vintfLegacy) {
