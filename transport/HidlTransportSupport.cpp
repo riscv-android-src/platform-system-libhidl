@@ -23,6 +23,8 @@
 namespace android {
 namespace hardware {
 
+using ::android::hidl::base::V1_0::IBase;
+
 void configureRpcThreadpool(size_t maxThreads, bool callerWillJoin) {
     // TODO(b/32756130) this should be transport-dependent
     configureBinderRpcThreadpool(maxThreads, callerWillJoin);
@@ -40,24 +42,30 @@ status_t handleTransportPoll(int /*fd*/) {
     return handleBinderPoll();
 }
 
-bool setMinSchedulerPolicy(const sp<::android::hidl::base::V1_0::IBase>& service,
-                           int policy, int priority) {
+bool setMinSchedulerPolicy(const sp<IBase>& service, int policy, int priority) {
     if (service->isRemote()) {
         LOG(ERROR) << "Can't set scheduler policy on remote service.";
         return false;
     }
 
-    if (policy != SCHED_NORMAL && policy != SCHED_FIFO && policy != SCHED_RR) {
-        LOG(ERROR) << "Invalid scheduler policy " << policy;
-        return false;
-    }
-
-    if (policy == SCHED_NORMAL && (priority < -20 || priority > 19)) {
-        LOG(ERROR) << "Invalid priority for SCHED_NORMAL: " << priority;
-        return false;
-    } else if (priority < 1 || priority > 99) {
-        LOG(ERROR) << "Invalid priority for real-time policy: " << priority;
-        return false;
+    switch (policy) {
+        case SCHED_NORMAL: {
+            if (priority < -20 || priority > 19) {
+                LOG(ERROR) << "Invalid priority for SCHED_NORMAL: " << priority;
+                return false;
+            }
+        } break;
+        case SCHED_RR:
+        case SCHED_FIFO: {
+            if (priority < 1 || priority > 99) {
+                LOG(ERROR) << "Invalid priority for " << policy << " policy: " << priority;
+                return false;
+            }
+        } break;
+        default: {
+            LOG(ERROR) << "Invalid scheduler policy " << policy;
+            return false;
+        }
     }
 
     // Due to ABI considerations, IBase cannot have a destructor to clean this up.
@@ -67,7 +75,7 @@ bool setMinSchedulerPolicy(const sp<::android::hidl::base::V1_0::IBase>& service
     // release in the meta-version sense, we should remove this.
     std::unique_lock<std::mutex> lock = details::gServicePrioMap.lock();
 
-    std::vector<wp<::android::hidl::base::V1_0::IBase>> toDelete;
+    std::vector<wp<IBase>> toDelete;
     for (const auto& kv : details::gServicePrioMap) {
         if (kv.first.promote() == nullptr) {
             toDelete.push_back(kv.first);
@@ -79,6 +87,13 @@ bool setMinSchedulerPolicy(const sp<::android::hidl::base::V1_0::IBase>& service
     details::gServicePrioMap.setLocked(service, {policy, priority});
 
     return true;
+}
+
+bool interfacesEqual(const sp<IBase>& left, const sp<IBase>& right) {
+    if (left == nullptr || right == nullptr || !left->isRemote() || !right->isRemote()) {
+        return left == right;
+    }
+    return getOrCreateCachedBinder(left.get()) == getOrCreateCachedBinder(right.get());
 }
 
 namespace details {

@@ -19,9 +19,11 @@
 #include <hidl/HidlBinderSupport.h>
 
 #include <InternalStatic.h>  // TODO(b/69122224): remove this include, for getOrCreateCachedBinder
+#include <android/hidl/base/1.0/BpHwBase.h>
 #include <hwbinder/IPCThreadState.h>
 
 // C includes
+#include <inttypes.h>
 #include <unistd.h>
 
 // C++ includes
@@ -92,6 +94,15 @@ status_t readEmbeddedFromParcel(const hidl_memory& memory,
                 parcel,
                 parentHandle,
                 parentOffset + hidl_memory::kOffsetOfName);
+    }
+
+    // hidl_memory's size is stored in uint64_t, but mapMemory's mmap will map
+    // size in size_t. If size is over SIZE_MAX, mapMemory could succeed
+    // but the mapped memory's actual size will be smaller than the reported size.
+    if (memory.size() > SIZE_MAX) {
+        ALOGE("Cannot use memory with %" PRId64 " bytes because it is too large.", memory.size());
+        android_errorWriteLog(0x534e4554, "79376389");
+        return BAD_VALUE;
     }
 
     return _hidl_err;
@@ -226,8 +237,17 @@ status_t writeToParcel(const Status &s, Parcel* parcel) {
 }
 
 sp<IBinder> getOrCreateCachedBinder(::android::hidl::base::V1_0::IBase* ifacePtr) {
-    LOG_ALWAYS_FATAL_IF(ifacePtr->isRemote(), "%s does not have a way to construct remote binders",
-                        __func__);
+    if (ifacePtr == nullptr) {
+        return nullptr;
+    }
+
+    if (ifacePtr->isRemote()) {
+        using ::android::hidl::base::V1_0::BpHwBase;
+
+        BpHwBase* bpBase = static_cast<BpHwBase*>(ifacePtr);
+        BpHwRefBase* bpRefBase = static_cast<BpHwRefBase*>(bpBase);
+        return sp<IBinder>(bpRefBase->remote());
+    }
 
     std::string descriptor = details::getDescriptor(ifacePtr);
     if (descriptor.empty()) {
