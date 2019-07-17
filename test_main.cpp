@@ -319,6 +319,37 @@ TEST_F(LibHidlTest, VecRangeCtorTest) {
     EXPECT_EQ(sum, 1 + 2 + 3);
 }
 
+struct FailsIfCopied {
+    FailsIfCopied() {}
+
+    // add failure if copied since in general this can be expensive
+    FailsIfCopied(const FailsIfCopied& o) { *this = o; }
+    FailsIfCopied& operator=(const FailsIfCopied&) {
+        ADD_FAILURE() << "FailsIfCopied copied";
+        return *this;
+    }
+
+    // fine to move this type since in general this is cheaper
+    FailsIfCopied(FailsIfCopied&& o) = default;
+    FailsIfCopied& operator=(FailsIfCopied&&) = default;
+};
+
+TEST_F(LibHidlTest, VecResizeNoCopy) {
+    using android::hardware::hidl_vec;
+
+    hidl_vec<FailsIfCopied> noCopies;
+    noCopies.resize(3);  // instantiates three elements
+
+    FailsIfCopied* oldPointer = noCopies.data();
+
+    noCopies.resize(6);  // should move three elements, not copy
+
+    // oldPointer should be invalidated at this point.
+    // hidl_vec doesn't currently try to realloc but if it ever switches
+    // to an implementation that does, this test wouldn't do anything.
+    EXPECT_NE(oldPointer, noCopies.data());
+}
+
 TEST_F(LibHidlTest, ArrayTest) {
     using android::hardware::hidl_array;
     int32_t array[] = {5, 6, 7};
@@ -451,6 +482,22 @@ TEST_F(LibHidlTest, ReturnTest) {
 
     const hidl_string three = "3";
     EXPECT_EQ(three, ret.withDefault(three));
+}
+
+TEST_F(LibHidlTest, ReturnDies) {
+    using ::android::hardware::Return;
+    using ::android::hardware::Status;
+
+    EXPECT_DEATH({ Return<void>(Status::fromStatusT(-EBUSY)); }, "");
+    EXPECT_DEATH({ Return<void>(Status::fromStatusT(-EBUSY)).isDeadObject(); }, "");
+    EXPECT_DEATH(
+            {
+                Return<int> ret = Return<int>(Status::fromStatusT(-EBUSY));
+                int foo = ret;  // should crash here
+                (void)foo;
+                ret.isOk();
+            },
+            "");
 }
 
 std::string toString(const ::android::hardware::Status &s) {
