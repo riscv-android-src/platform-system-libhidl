@@ -328,11 +328,15 @@ template<typename T>
 struct hidl_vec {
     using value_type = T;
 
-    hidl_vec()
-        : mBuffer(nullptr),
-          mSize(0),
-          mOwnsBuffer(true) {
+    hidl_vec() {
         static_assert(hidl_vec<T>::kOffsetOfBuffer == 0, "wrong offset");
+
+        memset(this, 0, sizeof(*this));
+        // mSize is 0
+        // mBuffer is nullptr
+
+        // this is for consistency with the original implementation
+        mOwnsBuffer = true;
     }
 
     // Note, does not initialize primitive types.
@@ -342,12 +346,23 @@ struct hidl_vec {
         *this = other;
     }
 
-    hidl_vec(hidl_vec<T> &&other) noexcept
-    : mOwnsBuffer(false) {
+    hidl_vec(hidl_vec<T> &&other) noexcept : hidl_vec() {
         *this = std::move(other);
     }
 
-    hidl_vec(const std::initializer_list<T> list) : hidl_vec() { *this = list; }
+    hidl_vec(const std::initializer_list<T> list) : hidl_vec() {
+        if (list.size() > UINT32_MAX) {
+            details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
+        }
+        mSize = static_cast<uint32_t>(list.size());
+        mBuffer = new T[mSize]();
+        mOwnsBuffer = true;
+
+        size_t idx = 0;
+        for (auto it = list.begin(); it != list.end(); ++it) {
+            mBuffer[idx++] = *it;
+        }
+    }
 
     hidl_vec(const std::vector<T> &other) : hidl_vec() {
         *this = other;
@@ -357,7 +372,7 @@ struct hidl_vec {
               typename = typename std::enable_if<std::is_convertible<
                   typename std::iterator_traits<InputIterator>::iterator_category,
                   std::input_iterator_tag>::value>::type>
-    hidl_vec(InputIterator first, InputIterator last) : mOwnsBuffer(true) {
+    hidl_vec(InputIterator first, InputIterator last) : hidl_vec() {
         auto size = std::distance(first, last);
         if (size > static_cast<int64_t>(UINT32_MAX)) {
             details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
@@ -366,7 +381,8 @@ struct hidl_vec {
             details::logAlwaysFatal("size can't be negative.");
         }
         mSize = static_cast<uint32_t>(size);
-        mBuffer = new T[mSize];
+        mBuffer = new T[mSize]();
+        mOwnsBuffer = true;
 
         size_t idx = 0;
         for (; first != last; ++first) {
@@ -505,10 +521,10 @@ struct hidl_vec {
         if (size > UINT32_MAX) {
             details::logAlwaysFatal("hidl_vec can't hold more than 2^32 elements.");
         }
-        T *newBuffer = new T[size];
+        T* newBuffer = new T[size]();
 
         for (size_t i = 0; i < std::min(static_cast<uint32_t>(size), mSize); ++i) {
-            newBuffer[i] = mBuffer[i];
+            newBuffer[i] = std::move(mBuffer[i]);
         }
 
         if (mOwnsBuffer) {
@@ -569,8 +585,11 @@ public:
     iterator end() { return data()+mSize; }
     const_iterator begin() const { return data(); }
     const_iterator end() const { return data()+mSize; }
+    iterator find(const T& v) { return std::find(begin(), end(), v); }
+    const_iterator find(const T& v) const { return std::find(begin(), end(), v); }
+    bool contains(const T& v) const { return find(v) != end(); }
 
-private:
+  private:
     details::hidl_pointer<T> mBuffer;
     uint32_t mSize;
     bool mOwnsBuffer;
@@ -581,7 +600,7 @@ private:
         mSize = static_cast<uint32_t>(size);
         mOwnsBuffer = true;
         if (mSize > 0) {
-            mBuffer = new T[size];
+            mBuffer = new T[size]();
             for (size_t i = 0; i < size; ++i) {
                 mBuffer[i] = data[i];
             }
@@ -729,6 +748,8 @@ struct hidl_array {
     using std_array_type = typename details::std_array<T, SIZE1, SIZES...>::type;
 
     hidl_array() = default;
+    hidl_array(const hidl_array&) noexcept = default;
+    hidl_array(hidl_array&&) noexcept = default;
 
     // Copies the data from source, using T::operator=(const T &).
     hidl_array(const T *source) {
@@ -742,6 +763,9 @@ struct hidl_array {
         details::accessor<T, SIZE1, SIZES...> modifier(mBuffer);
         modifier = array;
     }
+
+    hidl_array& operator=(const hidl_array&) noexcept = default;
+    hidl_array& operator=(hidl_array&&) noexcept = default;
 
     T *data() { return mBuffer; }
     const T *data() const { return mBuffer; }
@@ -795,6 +819,8 @@ struct hidl_array<T, SIZE1> {
     using std_array_type = typename details::std_array<T, SIZE1>::type;
 
     hidl_array() = default;
+    hidl_array(const hidl_array&) noexcept = default;
+    hidl_array(hidl_array&&) noexcept = default;
 
     // Copies the data from source, using T::operator=(const T &).
     hidl_array(const T *source) {
@@ -805,6 +831,9 @@ struct hidl_array<T, SIZE1> {
 
     // Copies the data from the given std::array, using T::operator=(const T &).
     hidl_array(const std_array_type &array) : hidl_array(array.data()) {}
+
+    hidl_array& operator=(const hidl_array&) noexcept = default;
+    hidl_array& operator=(hidl_array&&) noexcept = default;
 
     T *data() { return mBuffer; }
     const T *data() const { return mBuffer; }
@@ -851,7 +880,9 @@ private:
 // Version functions
 struct hidl_version {
 public:
-    constexpr hidl_version(uint16_t major, uint16_t minor) : mMajor(major), mMinor(minor) {}
+    constexpr hidl_version(uint16_t major, uint16_t minor) : mMajor(major), mMinor(minor) {
+        static_assert(sizeof(*this) == 4, "wrong size");
+    }
 
     bool operator==(const hidl_version& other) const {
         return (mMajor == other.get_major() && mMinor == other.get_minor());
