@@ -117,4 +117,5 @@ bool deleteHalToken(const HalToken& token) {
     return static_cast<bool>(transaction);
 }
 
-}  // namespace android
+}; // namespace android
+

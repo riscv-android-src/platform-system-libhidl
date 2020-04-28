@@ -28,9 +28,8 @@ cc_defaults {
 
 cc_library {
     name: "libhidlbase-impl-internal",
-    host_supported: true,
-    recovery_available: true,
     vendor_available: true,
+    recovery_available: true,
     defaults: [
         "libhidlbase-impl-shared-libs",
         "libhidl-defaults"
@@ -54,6 +53,4 @@ cc_library {
             cflags: ["-DLIBHIDL_TARGET_DEBUGGABLE"],
         },
     },
-
-    visibility: ["//system/libhidl:__subpackages__"],
 }

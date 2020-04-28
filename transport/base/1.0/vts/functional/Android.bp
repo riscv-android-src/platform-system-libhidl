@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 cc_test {
     name: "vts_ibase_test",
     srcs: [
@@ -24,12 +25,10 @@ cc_test {
     shared_libs: [
         "libbase",
         "libhidlbase",
+        "libhidltransport",
+        "libhwbinder",
         "liblog",
         "libutils",
-        "libprotobuf-cpp-lite",
-        "libhidl-gen-utils",
-    ],
-    static_libs: [
-        "libinit_test_utils",
     ],
 }
+

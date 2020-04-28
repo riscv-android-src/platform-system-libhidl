@@ -14,12 +14,9 @@
  * limitations under the License.
  */
 
-#define LOG_TAG "HidlServiceManagement"
+#define LOG_TAG "ServiceManagement"
 
-#ifdef __ANDROID__
 #include <android/dlext.h>
-#endif  // __ANDROID__
-
 #include <condition_variable>
 #include <dlfcn.h>
 #include <dirent.h>
@@ -46,7 +43,7 @@
 #include <android-base/strings.h>
 #include <hwbinder/IPCThreadState.h>
 #include <hwbinder/Parcel.h>
-#if !defined(__ANDROID_RECOVERY__) && defined(__ANDROID__)
+#if !defined(__ANDROID_RECOVERY__)
 #include <vndksupport/linker.h>
 #endif
 
@@ -58,6 +55,8 @@
 #define RE_PATH         RE_COMPONENT "(?:[.]" RE_COMPONENT ")*"
 static const std::regex gLibraryFileNamePattern("(" RE_PATH "@[0-9]+[.][0-9]+)-impl(.*?).so");
 
+using android::base::WaitForProperty;
+
 using ::android::hidl::base::V1_0::IBase;
 using IServiceManager1_0 = android::hidl::manager::V1_0::IServiceManager;
 using IServiceManager1_1 = android::hidl::manager::V1_1::IServiceManager;
@@ -67,6 +66,8 @@ using ::android::hidl::manager::V1_0::IServiceNotification;
 namespace android {
 namespace hardware {
 
+static const char* kHwServicemanagerReadyProperty = "hwservicemanager.ready";
+
 #if defined(__ANDROID_RECOVERY__)
 static constexpr bool kIsRecovery = true;
 #else
@@ -74,18 +75,11 @@ static constexpr bool kIsRecovery = false;
 #endif
 
 static void waitForHwServiceManager() {
-    // TODO(b/31559095): need bionic host so that we can use 'prop_info' returned
-    // from WaitForProperty
-#ifdef __ANDROID__
-    static const char* kHwServicemanagerReadyProperty = "hwservicemanager.ready";
-
     using std::literals::chrono_literals::operator""s;
 
-    using android::base::WaitForProperty;
     while (!WaitForProperty(kHwServicemanagerReadyProperty, "true", 1s)) {
         LOG(WARNING) << "Waited for hwservicemanager.ready for a second, waiting another...";
     }
-#endif  // __ANDROID__
 }
 
 static std::string binaryName() {
@@ -382,6 +376,13 @@ struct PassthroughServiceManager : IServiceManager1_1 {
             } else if (!eachLib(handle, "SELF", sym)) {
                 return;
             }
+
+            const char* vtsRootPath = std::getenv("VTS_ROOT_PATH");
+            if (vtsRootPath && strlen(vtsRootPath) > 0) {
+                const std::string halLibraryPathVtsOverride =
+                    std::string(vtsRootPath) + HAL_LIBRARY_PATH_SYSTEM;
+                paths.insert(paths.begin(), halLibraryPathVtsOverride);
+            }
         }
 #endif
 
@@ -394,7 +395,7 @@ struct PassthroughServiceManager : IServiceManager1_1 {
                 if (kIsRecovery || path == HAL_LIBRARY_PATH_SYSTEM) {
                     handle = dlopen(fullPath.c_str(), dlMode);
                 } else {
-#if !defined(__ANDROID_RECOVERY__) && defined(__ANDROID__)
+#if !defined(__ANDROID_RECOVERY__)
                     handle = android_load_sphal_library(fullPath.c_str(), dlMode);
 #endif
                 }
@@ -556,18 +557,6 @@ sp<IServiceManager1_0> getPassthroughServiceManager() {
 sp<IServiceManager1_1> getPassthroughServiceManager1_1() {
     static sp<PassthroughServiceManager> manager(new PassthroughServiceManager());
     return manager;
-}
-
-std::vector<std::string> getAllHalInstanceNames(const std::string& descriptor) {
-    std::vector<std::string> ret;
-    auto sm = defaultServiceManager1_2();
-    sm->listManifestByInterface(descriptor, [&](const auto& instances) {
-        ret.reserve(instances.size());
-        for (const auto& i : instances) {
-            ret.push_back(i);
-        }
-    });
-    return ret;
 }
 
 namespace details {
@@ -734,32 +723,11 @@ bool handleCastError(const Return<bool>& castReturn, const std::string& descript
     return false;
 }
 
-#ifdef ENFORCE_VINTF_MANIFEST
-static constexpr bool kEnforceVintfManifest = true;
-#else
-static constexpr bool kEnforceVintfManifest = false;
-#endif
-
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-static constexpr bool kDebuggable = true;
-#else
-static constexpr bool kDebuggable = false;
-#endif
-
-static inline bool isTrebleTestingOverride() {
-    if (kEnforceVintfManifest && !kDebuggable) {
-        // don't allow testing override in production
-        return false;
-    }
-
-    const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
-    return env && !strcmp(env, "true");
-}
-
 sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& descriptor,
                                                              const std::string& instance,
                                                              bool retry, bool getStub) {
-    using Transport = IServiceManager1_0::Transport;
+    using Transport = ::android::hidl::manager::V1_0::IServiceManager::Transport;
+    using ::android::hidl::manager::V1_0::IServiceManager;
     sp<Waiter> waiter;
 
     sp<IServiceManager1_1> sm;
@@ -785,19 +753,23 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
 
     const bool vintfHwbinder = (transport == Transport::HWBINDER);
     const bool vintfPassthru = (transport == Transport::PASSTHROUGH);
-    const bool trebleTestingOverride = isTrebleTestingOverride();
-    const bool allowLegacy = !kEnforceVintfManifest || (trebleTestingOverride && kDebuggable);
-    const bool vintfLegacy = (transport == Transport::EMPTY) && allowLegacy;
 
-    if (!kEnforceVintfManifest) {
-        ALOGE("getService: Potential race detected. The VINTF manifest is not being enforced. If "
-              "a HAL server has a delay in starting and it is not in the manifest, it will not be "
-              "retrieved. Please make sure all HALs on this device are in the VINTF manifest and "
-              "enable PRODUCT_ENFORCE_VINTF_MANIFEST on this device (this is also enabled by "
-              "PRODUCT_FULL_TREBLE). PRODUCT_ENFORCE_VINTF_MANIFEST will ensure that no race "
-              "condition is possible here.");
-        sleep(1);
-    }
+#ifdef ENFORCE_VINTF_MANIFEST
+
+#ifdef LIBHIDL_TARGET_DEBUGGABLE
+    const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
+    const bool trebleTestingOverride = env && !strcmp(env, "true");
+    const bool vintfLegacy = (transport == Transport::EMPTY) && trebleTestingOverride;
+#else   // ENFORCE_VINTF_MANIFEST but not LIBHIDL_TARGET_DEBUGGABLE
+    const bool trebleTestingOverride = false;
+    const bool vintfLegacy = false;
+#endif  // LIBHIDL_TARGET_DEBUGGABLE
+
+#else   // not ENFORCE_VINTF_MANIFEST
+    const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
+    const bool trebleTestingOverride = env && !strcmp(env, "true");
+    const bool vintfLegacy = (transport == Transport::EMPTY);
+#endif  // ENFORCE_VINTF_MANIFEST
 
     for (int tries = 0; !getStub && (vintfHwbinder || vintfLegacy); tries++) {
         if (waiter == nullptr && tries > 0) {
@@ -841,7 +813,7 @@ sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& 
     }
 
     if (getStub || vintfPassthru || vintfLegacy) {
-        const sp<IServiceManager1_0> pm = getPassthroughServiceManager();
+        const sp<IServiceManager> pm = getPassthroughServiceManager();
         if (pm != nullptr) {
             sp<IBase> base = pm->get(descriptor, instance).withDefault(nullptr);
             if (!getStub || trebleTestingOverride) {
@@ -864,19 +836,6 @@ status_t registerAsServiceInternal(const sp<IBase>& service, const std::string& 
         return INVALID_OPERATION;
     }
 
-    const std::string descriptor = getDescriptor(service.get());
-
-    if (kEnforceVintfManifest && !isTrebleTestingOverride()) {
-        using Transport = IServiceManager1_0::Transport;
-        Transport transport = sm->getTransport(descriptor, name);
-
-        if (transport != Transport::HWBINDER) {
-            LOG(ERROR) << "Service " << descriptor << "/" << name
-                       << " must be in VINTF manifest in order to register/get.";
-            return UNKNOWN_ERROR;
-        }
-    }
-
     bool registered = false;
     Return<void> ret = service->interfaceChain([&](const auto& chain) {
         registered = sm->addWithChain(name.c_str(), service, chain).withDefault(false);
@@ -887,7 +846,7 @@ status_t registerAsServiceInternal(const sp<IBase>& service, const std::string& 
     }
 
     if (registered) {
-        onRegistrationImpl(descriptor, name);
+        onRegistrationImpl(getDescriptor(service.get()), name);
     }
 
     return registered ? OK : UNKNOWN_ERROR;
