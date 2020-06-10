@@ -192,6 +192,7 @@ static void onRegistrationImpl(const std::string& descriptor, const std::string&
     tryShortenProcessName(descriptor);
 }
 
+// only used by prebuilts - should be able to remove
 void onRegistration(const std::string& packageName, const std::string& interfaceName,
                     const std::string& instanceName) {
     return onRegistrationImpl(packageName + "::" + interfaceName, instanceName);
@@ -209,8 +210,8 @@ sp<IServiceManager1_2> defaultServiceManager1_2() {
     using android::hidl::manager::V1_2::BnHwServiceManager;
     using android::hidl::manager::V1_2::BpHwServiceManager;
 
-    static std::mutex gDefaultServiceManagerLock;
-    static sp<IServiceManager1_2> gDefaultServiceManager;
+    static std::mutex& gDefaultServiceManagerLock = *new std::mutex;
+    static sp<IServiceManager1_2>& gDefaultServiceManager = *new sp<IServiceManager1_2>;
 
     {
         std::lock_guard<std::mutex> _l(gDefaultServiceManagerLock);
