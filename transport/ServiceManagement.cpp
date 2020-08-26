@@ -87,7 +87,7 @@ static void waitForHwServiceManager() {
 static std::string binaryName() {
     std::ifstream ifs("/proc/self/cmdline");
     std::string cmdline;
-    if (!ifs.is_open()) {
+    if (!ifs) {
         return "";
     }
     ifs >> cmdline;
@@ -106,7 +106,7 @@ static std::string packageWithoutVersion(const std::string& packageAndVersion) {
     return packageAndVersion.substr(0, at);
 }
 
-static void tryShortenProcessName(const std::string& descriptor) {
+__attribute__((noinline)) static void tryShortenProcessName(const std::string& descriptor) {
     const static std::string kTasks = "/proc/self/task/";
 
     // make sure that this binary name is in the same package
@@ -135,17 +135,17 @@ static void tryShortenProcessName(const std::string& descriptor) {
         if (dp->d_name[0] == '.') continue;
 
         std::fstream fs(kTasks + dp->d_name + "/comm");
-        if (!fs.is_open()) {
+        if (!fs) {
             ALOGI("Could not rename process, failed read comm for %s.", dp->d_name);
             continue;
         }
 
         std::string oldComm;
-        fs >> oldComm;
+        if (!(fs >> oldComm)) continue;
 
         // don't rename if it already has an explicit name
         if (base::StartsWith(descriptor, oldComm)) {
-            fs.seekg(0, fs.beg);
+            if (!fs.seekg(0, fs.beg)) continue;
             fs << newName;
         }
     }
@@ -153,11 +153,41 @@ static void tryShortenProcessName(const std::string& descriptor) {
 
 namespace details {
 
+#ifdef ENFORCE_VINTF_MANIFEST
+static constexpr bool kEnforceVintfManifest = true;
+#else
+static constexpr bool kEnforceVintfManifest = false;
+#endif
+
+#ifdef LIBHIDL_TARGET_DEBUGGABLE
+static constexpr bool kDebuggable = true;
+#else
+static constexpr bool kDebuggable = false;
+#endif
+
+static bool* getTrebleTestingOverridePtr() {
+    static bool gTrebleTestingOverride = false;
+    return &gTrebleTestingOverride;
+}
+
+void setTrebleTestingOverride(bool testingOverride) {
+    *getTrebleTestingOverridePtr() = testingOverride;
+}
+
+static inline bool isTrebleTestingOverride() {
+    if (kEnforceVintfManifest && !kDebuggable) {
+        // don't allow testing override in production
+        return false;
+    }
+
+    return *getTrebleTestingOverridePtr();
+}
+
 /*
  * Returns the age of the current process by reading /proc/self/stat and comparing starttime to the
  * current time. This is useful for measuring how long it took a HAL to register itself.
  */
-static long getProcessAgeMs() {
+__attribute__((noinline)) static long getProcessAgeMs() {
     constexpr const int PROCFS_STAT_STARTTIME_INDEX = 21;
     std::string content;
     android::base::ReadFileToString("/proc/self/stat", &content, false);
@@ -373,10 +403,7 @@ struct PassthroughServiceManager : IServiceManager1_1 {
 #endif
         };
 
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-        const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
-        const bool trebleTestingOverride = env && !strcmp(env, "true");
-        if (trebleTestingOverride) {
+        if (details::isTrebleTestingOverride()) {
             // Load HAL implementations that are statically linked
             handle = dlopen(nullptr, dlMode);
             if (handle == nullptr) {
@@ -387,7 +414,6 @@ struct PassthroughServiceManager : IServiceManager1_1 {
                 return;
             }
         }
-#endif
 
         for (const std::string& path : paths) {
             std::vector<std::string> libs = findFiles(path, prefix, ".so");
@@ -736,28 +762,6 @@ bool handleCastError(const Return<bool>& castReturn, const std::string& descript
     ALOGW("getService: unable to call into hwbinder service for %s/%s.",
           descriptor.c_str(), instance.c_str());
     return false;
-}
-
-#ifdef ENFORCE_VINTF_MANIFEST
-static constexpr bool kEnforceVintfManifest = true;
-#else
-static constexpr bool kEnforceVintfManifest = false;
-#endif
-
-#ifdef LIBHIDL_TARGET_DEBUGGABLE
-static constexpr bool kDebuggable = true;
-#else
-static constexpr bool kDebuggable = false;
-#endif
-
-static inline bool isTrebleTestingOverride() {
-    if (kEnforceVintfManifest && !kDebuggable) {
-        // don't allow testing override in production
-        return false;
-    }
-
-    const char* env = std::getenv("TREBLE_TESTING_OVERRIDE");
-    return env && !strcmp(env, "true");
 }
 
 sp<::android::hidl::base::V1_0::IBase> getRawServiceInternal(const std::string& descriptor,
