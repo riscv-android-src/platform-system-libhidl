@@ -26,16 +26,25 @@ namespace details {
 class LazyServiceRegistrarImpl;
 }  // namespace details
 
-/** Exits when all HALs registered through this object have 0 clients */
+/**
+ * Exits when all HALs registered through this object have 0 clients
+ *
+ * In order to use this class, it's expected that your service:
+ * - registers all services in the process with this API
+ * - configures services as oneshot + disabled in init .rc files
+ * - uses 'interface' declarations in init .rc files
+ *
+ * For more information on init .rc configuration, see system/core/init/README.md
+ **/
 class LazyServiceRegistrar {
    public:
-     LazyServiceRegistrar();
      static LazyServiceRegistrar& getInstance();
      status_t registerService(const sp<::android::hidl::base::V1_0::IBase>& service,
                               const std::string& name = "default");
 
    private:
      std::shared_ptr<details::LazyServiceRegistrarImpl> mImpl;
+     LazyServiceRegistrar();
 };
 
 }  // namespace hardware
