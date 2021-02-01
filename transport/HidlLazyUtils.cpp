@@ -36,6 +36,12 @@ class ClientCounterCallback : public ::android::hidl::manager::V1_2::IClientCall
 
     bool addRegisteredService(const sp<IBase>& service, const std::string& name);
 
+    bool tryUnregister();
+
+    void reRegister();
+
+    void setActiveServicesCallback(const std::function<bool(bool)>& activeServicesCallback);
+
   protected:
     Return<void> onClients(const sp<IBase>& service, bool clients) override;
 
@@ -44,6 +50,8 @@ class ClientCounterCallback : public ::android::hidl::manager::V1_2::IClientCall
         sp<IBase> service;
         std::string name;
         bool clients = false;
+        // Used to keep track of unregistered services to allow re-registry
+        bool registered = true;
     };
 
     /**
@@ -67,6 +75,16 @@ class ClientCounterCallback : public ::android::hidl::manager::V1_2::IClientCall
      * Number of services that have been registered.
      */
     std::vector<Service> mRegisteredServices;
+
+    /**
+     * Callback for reporting the number of services with clients.
+     */
+    std::function<bool(bool)> mActiveServicesCallback;
+
+    /**
+     * Previous value passed to the active services callback.
+     */
+    std::optional<bool> mPreviousHasClients;
 };
 
 class LazyServiceRegistrarImpl {
@@ -75,6 +93,9 @@ class LazyServiceRegistrarImpl {
 
     status_t registerService(const sp<::android::hidl::base::V1_0::IBase>& service,
                              const std::string& name);
+    bool tryUnregister();
+    void reRegister();
+    void setActiveServicesCallback(const std::function<bool(bool)>& activeServicesCallback);
 
   private:
     sp<ClientCounterCallback> mClientCallback;
@@ -147,46 +168,77 @@ Return<void> ClientCounterCallback::onClients(const sp<::android::hidl::base::V1
               << " available) client(s) in use after notification " << getDescriptor(service.get())
               << "/" << registered.name << " has clients: " << clients;
 
-    if (numWithClients == 0) {
+    bool handledInCallback = false;
+    if (mActiveServicesCallback != nullptr) {
+        bool hasClients = numWithClients != 0;
+        if (hasClients != mPreviousHasClients) {
+            handledInCallback = mActiveServicesCallback(hasClients);
+            mPreviousHasClients = hasClients;
+        }
+    }
+
+    // If there is no callback defined or the callback did not handle this
+    // client count change event, try to shutdown the process if its services
+    // have no clients.
+    if (!handledInCallback && numWithClients == 0) {
         tryShutdown();
     }
 
     return Status::ok();
 }
 
-void ClientCounterCallback::tryShutdown() {
-    LOG(INFO) << "Trying to exit HAL. No clients in use for any service in process.";
-
+bool ClientCounterCallback::tryUnregister() {
     auto manager = hardware::defaultServiceManager1_2();
 
-    auto unRegisterIt = mRegisteredServices.begin();
-    for (; unRegisterIt != mRegisteredServices.end(); ++unRegisterIt) {
-        auto& entry = (*unRegisterIt);
-
+    for (Service& entry : mRegisteredServices) {
         const std::string descriptor = getDescriptor(entry.service.get());
         bool success = manager->tryUnregister(descriptor, entry.name, entry.service);
 
         if (!success) {
             LOG(INFO) << "Failed to unregister HAL " << descriptor << "/" << entry.name;
-            break;
+            return false;
         }
+
+        // Mark the entry unregistered, but do not remove it (may still be re-registered)
+        entry.registered = false;
     }
 
-    if (unRegisterIt == mRegisteredServices.end()) {
-        LOG(INFO) << "Unregistered all clients and exiting";
-        exit(EXIT_SUCCESS);
-    }
+    return true;
+}
 
-    for (auto reRegisterIt = mRegisteredServices.begin(); reRegisterIt != unRegisterIt;
-         reRegisterIt++) {
-        auto& entry = (*reRegisterIt);
+void ClientCounterCallback::reRegister() {
+    for (Service& entry : mRegisteredServices) {
+        // re-register entry if not already registered
+        if (entry.registered) {
+            continue;
+        }
 
-        // re-register entry
         if (!registerService(entry.service, entry.name)) {
             // Must restart. Otherwise, clients will never be able to get ahold of this service.
             LOG(FATAL) << "Bad state: could not re-register " << getDescriptor(entry.service.get());
         }
+
+        entry.registered = true;
     }
+}
+
+void ClientCounterCallback::tryShutdown() {
+    LOG(INFO) << "Trying to exit HAL. No clients in use for any service in process.";
+
+    if (tryUnregister()) {
+        LOG(INFO) << "Unregistered all clients and exiting";
+        exit(EXIT_SUCCESS);
+    }
+
+    // At this point, we failed to unregister some of the services, leaving the
+    // server in an inconsistent state. Re-register all services that were
+    // unregistered by tryUnregister().
+    reRegister();
+}
+
+void ClientCounterCallback::setActiveServicesCallback(
+        const std::function<bool(bool)>& activeServicesCallback) {
+    mActiveServicesCallback = activeServicesCallback;
 }
 
 status_t LazyServiceRegistrarImpl::registerService(
@@ -196,6 +248,19 @@ status_t LazyServiceRegistrarImpl::registerService(
     }
 
     return ::android::OK;
+}
+
+bool LazyServiceRegistrarImpl::tryUnregister() {
+    return mClientCallback->tryUnregister();
+}
+
+void LazyServiceRegistrarImpl::reRegister() {
+    mClientCallback->reRegister();
+}
+
+void LazyServiceRegistrarImpl::setActiveServicesCallback(
+        const std::function<bool(bool)>& activeServicesCallback) {
+    mClientCallback->setActiveServicesCallback(activeServicesCallback);
 }
 
 }  // namespace details
@@ -212,6 +277,19 @@ LazyServiceRegistrar& LazyServiceRegistrar::getInstance() {
 status_t LazyServiceRegistrar::registerService(
     const sp<::android::hidl::base::V1_0::IBase>& service, const std::string& name) {
     return mImpl->registerService(service, name);
+}
+
+bool LazyServiceRegistrar::tryUnregister() {
+    return mImpl->tryUnregister();
+}
+
+void LazyServiceRegistrar::reRegister() {
+    mImpl->reRegister();
+}
+
+void LazyServiceRegistrar::setActiveServicesCallback(
+        const std::function<bool(bool)>& activeServicesCallback) {
+    mImpl->setActiveServicesCallback(activeServicesCallback);
 }
 
 }  // namespace hardware
